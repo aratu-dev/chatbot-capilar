@@ -608,7 +608,8 @@ function gerarDashboard(leads) {
   }
   function highlight(text,term){
     if(!term)return text
-    const escaped=term.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')
+    var chars='\\^$.|?*+()[]{}'
+    var escaped=term.split('').map(function(c){return chars.indexOf(c)>=0?'\\'+c:c}).join('')
     return text.replace(new RegExp('('+escaped+')','gi'),'<mark>$1</mark>')
   }
   const totalLeads=${total}
