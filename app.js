@@ -403,18 +403,27 @@ function gerarDashboard(leads) {
   const dorMaisComum = Object.entries(contagemDor).sort((a,b) => b[1]-a[1])[0]?.[0] || '—'
   const objMaisComum = Object.entries(contagemObj).sort((a,b) => b[1]-a[1])[0]?.[0] || '—'
 
-  const linhas = leads.slice().reverse().map(l => `
-    <tr data-nome="${escHtml(l.nome)}" data-tel="${escHtml(l.telefone)}" data-nome-original="${escHtml(l.nome)}" data-tel-original="${escHtml(l.telefone)}">
-      <td><div class="lead-name">${escHtml(l.nome)}</div><div class="lead-phone">${escHtml(l.telefone)}</div></td>
-      <td><span class="badge">${escHtml(l.idade)} anos</span></td>
-      <td>${escHtml(l.dorPrincipal)}</td>
-      <td>${escHtml(l.intensidade)}</td>
-      <td>${escHtml(l.tempoProblema)}</td>
-      <td>${escHtml(l.tratamentoAnterior)}</td>
-      <td>${escHtml(l.objetivoAtual)}</td>
-      <td>${escHtml(l.quimica)}</td>
+  const linhas = leads.slice().reverse().map(l => {
+    // Limpa telefone legado que pode conter @lid, @s.whatsapp.net ou outros sufixos
+    const tel = (l.telefone || '').replace(/@.*/g, '').replace(/[^0-9+]/g, '')
+    // Se idade vier com "anos" embutido (dados legados), extrai só o número
+    const idade = (l.idade || '').replace(/[^0-9]/g, '')
+    return `
+    <tr data-nome="${escHtml(l.nome)}" data-tel="${escHtml(tel)}" data-nome-original="${escHtml(l.nome)}" data-tel-original="${escHtml(tel)}">
+      <td>
+        <div class="lead-name">${escHtml(l.nome)}</div>
+        <div class="lead-phone">${escHtml(tel) || '—'}</div>
+      </td>
+      <td><span class="badge">${escHtml(idade) || '—'} anos</span></td>
+      <td>${escHtml(l.dorPrincipal) || '—'}</td>
+      <td>${escHtml(l.intensidade) || '—'}</td>
+      <td>${escHtml(l.tempoProblema) || '—'}</td>
+      <td>${escHtml(l.tratamentoAnterior) || '—'}</td>
+      <td>${escHtml(l.objetivoAtual) || '—'}</td>
+      <td>${escHtml(l.quimica) || '—'}</td>
       <td class="date-cell">${escHtml(l.dataHora)}</td>
-    </tr>`).join('')
+    </tr>`
+  }).join('')
 
   const statusBot = botState.status === 'conectado'
     ? `<span class="bot-status connected"><span class="dot"></span>Bot online</span>`
