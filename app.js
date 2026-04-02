@@ -29,15 +29,16 @@ _Se precisar, é só me chamar._ 😊`
 
 const CAMINHO_CSV = path.join(__dirname, 'leads.csv')
 const CAMINHO_ESTADO = path.join(__dirname, 'estado.json')
+const CAMINHO_STATUS = path.join(__dirname, 'lead_status.json')
 
 // ─── ESTADO GLOBAL DO BOT ────────────────────────────────────────────────────
 
 const botState = {
-  status: 'aguardando', // 'aguardando' | 'qrcode' | 'conectado'
+  status: 'aguardando',
   qrcode: null
 }
 
-// ─── FUNÇÕES AUXILIARES ──────────────────────────────────────────────────────
+// ─── FUNÇÕES AUXILIARES DO BOT ───────────────────────────────────────────────
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -96,7 +97,9 @@ function validarResposta(etapa, texto) {
 
 function escaparCSV(v = '') { return `"${String(v).replace(/"/g, '""')}"` }
 function formatarDataHora() { return new Date().toLocaleString('pt-BR') }
-function extrairTelefone(jid = '') { return jid.replace('@s.whatsapp.net', '') }
+function extrairTelefone(jid = '') {
+  return jid.replace(/@.*/g, '').replace(/[^0-9+]/g, '')
+}
 
 function garantirArquivoCSV() {
   if (!fs.existsSync(CAMINHO_CSV)) {
@@ -119,7 +122,7 @@ function salvarLeadCSV(jid, r) {
 
 function carregarEstado() {
   try { if (fs.existsSync(CAMINHO_ESTADO)) return JSON.parse(fs.readFileSync(CAMINHO_ESTADO, 'utf8')) }
-  catch (e) { console.warn('⚠️ estado.json não encontrado, iniciando vazio.') }
+  catch (e) { console.warn('⚠️ estado.json não encontrado.') }
   return {}
 }
 
@@ -128,8 +131,87 @@ function salvarEstado(u) {
   catch (e) { console.error('Erro ao salvar estado:', e) }
 }
 
+// ─── FUNÇÕES DE STATUS DE LEAD ───────────────────────────────────────────────
+
+function lerStatus() {
+  try {
+    if (!fs.existsSync(CAMINHO_STATUS)) return {}
+    const conteudo = fs.readFileSync(CAMINHO_STATUS, 'utf8')
+    return conteudo ? JSON.parse(conteudo) : {}
+  } catch (e) {
+    console.error('Erro ao ler lead_status.json:', e)
+    return {}
+  }
+}
+
+function salvarStatus(statusMap) {
+  try {
+    fs.writeFileSync(CAMINHO_STATUS, JSON.stringify(statusMap, null, 2), 'utf8')
+  } catch (e) {
+    console.error('Erro ao salvar lead_status.json:', e)
+  }
+}
+
+// ─── PARSER ROBUSTO DE CSV ───────────────────────────────────────────────────
+
+function parseLinhaCSV(linha) {
+  const valores = []
+  let atual = ''
+  let dentroAspas = false
+  for (let i = 0; i < linha.length; i++) {
+    const char = linha[i]
+    const prox = linha[i + 1]
+    if (char === '"') {
+      if (dentroAspas && prox === '"') { atual += '"'; i++ }
+      else { dentroAspas = !dentroAspas }
+    } else if (char === ';' && !dentroAspas) {
+      valores.push(atual); atual = ''
+    } else { atual += char }
+  }
+  valores.push(atual)
+  return valores
+}
+
+function lerLeads() {
+  try {
+    if (!fs.existsSync(CAMINHO_CSV)) return []
+    const conteudo = fs.readFileSync(CAMINHO_CSV, 'utf8').trim()
+    if (!conteudo) return []
+    const linhas = conteudo.split(/\r?\n/).filter(Boolean)
+    if (linhas.length <= 1) return []
+    const cabecalho = parseLinhaCSV(linhas[0])
+    return linhas.slice(1).map((linha, index) => {
+      const valores = parseLinhaCSV(linha)
+      const lead = {}
+      cabecalho.forEach((col, i) => { lead[col] = valores[i] || '' })
+      // Limpa telefone e idade legados
+      lead.telefone = (lead.telefone || '').replace(/@.*/g, '').replace(/[^0-9+]/g, '')
+      lead.idade = (lead.idade || '').replace(/[^0-9]/g, '')
+      lead._id = `${lead.telefone || 'sem-telefone'}_${lead.dataHora || index}`
+      return lead
+    }).filter(l => l.nome)
+  } catch (e) {
+    console.error('Erro ao ler leads.csv:', e)
+    return []
+  }
+}
+
 function escHtml(s = '') {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+}
+
+function contarPorStatus(leads, statusMap) {
+  const t = { total: leads.length, novo: 0, contatoFeito: 0, agendado: 0 }
+  for (const lead of leads) {
+    const s = statusMap[lead._id] || 'Novo'
+    if (s === 'Novo') t.novo++
+    if (s === 'Contato feito') t.contatoFeito++
+    if (s === 'Agendado') t.agendado++
+  }
+  return t
 }
 
 // ─── FLUXO ───────────────────────────────────────────────────────────────────
@@ -139,7 +221,7 @@ const fluxo = [
   { campo: 'idade', pergunta: 'Pra gente te atender da melhor forma, me conta: qual a sua idade?' },
   { campo: 'dorPrincipal', pergunta: 'Entendi. Agora me conta uma coisa 👇\n\nQual problema mais tem te incomodado no seu cabelo ultimamente?',
     opcoes: [
-      { label: 'Queda de cabelo', aliases: ['queda', 'cai muito', 'cabelo caindo'] },
+      { label: 'Queda de cabelo', aliases: ['queda', 'cai muito', 'cabelo caindo', 'queda capilar'] },
       { label: 'Falta de crescimento', aliases: ['nao cresce', 'crescimento', 'demora a crescer'] },
       { label: 'Ressecamento / frizz', aliases: ['ressecamento', 'frizz', 'ressecado', 'seco'] }
     ]
@@ -147,27 +229,27 @@ const fluxo = [
   { campo: 'intensidade', pergunta: 'E isso tem te incomodado em qual nível?',
     opcoes: [
       { label: 'Pouco, mas quero cuidar', aliases: ['pouco', 'leve'] },
-      { label: 'Médio, já está me preocupando', aliases: ['medio', 'preocupando'] },
+      { label: 'Médio, já está me preocupando', aliases: ['medio', 'preocupando', 'me preocupa'] },
       { label: 'Muito, está afetando minha autoestima', aliases: ['muito', 'autoestima', 'bastante'] }
     ]
   },
   { campo: 'tempoProblema', pergunta: 'Há quanto tempo você percebe esse problema?',
     opcoes: [
-      { label: 'Menos de 1 mês', aliases: ['menos de 1 mes', 'recente'] },
-      { label: 'De 1 a 6 meses', aliases: ['alguns meses'] },
-      { label: 'Mais de 6 meses', aliases: ['muito tempo', 'faz tempo'] }
+      { label: 'Menos de 1 mês', aliases: ['menos de 1 mes', 'menos de um mes', 'recente'] },
+      { label: 'De 1 a 6 meses', aliases: ['1 a 6 meses', 'alguns meses'] },
+      { label: 'Mais de 6 meses', aliases: ['mais de 6 meses', 'muito tempo', 'faz tempo'] }
     ]
   },
   { campo: 'tratamentoAnterior', pergunta: 'Você já tentou algum tratamento antes?',
     opcoes: [
       { label: 'Sim, com profissional', aliases: ['com profissional', 'clinica'] },
       { label: 'Sim, por conta própria', aliases: ['por conta propria', 'sozinho', 'sozinha', 'em casa'] },
-      { label: 'Ainda não, estou buscando ajuda agora', aliases: ['ainda nao', 'primeira vez'] }
+      { label: 'Ainda não, estou buscando ajuda agora', aliases: ['ainda nao', 'primeira vez', 'buscando ajuda'] }
     ]
   },
   { campo: 'objetivoAtual', pergunta: 'Hoje, o que você mais busca?',
     opcoes: [
-      { label: 'Resolver o problema de vez', aliases: ['resolver', 'de vez'] },
+      { label: 'Resolver o problema de vez', aliases: ['resolver', 'de vez', 'solucionar'] },
       { label: 'Melhorar a aparência do cabelo', aliases: ['melhorar aparencia', 'aparencia'] },
       { label: 'Entender o que está acontecendo', aliases: ['entender', 'descobrir'] }
     ]
@@ -207,7 +289,6 @@ async function iniciarBot() {
       console.log('📱 QR Code disponível em: /qrcode')
       qrcode.generate(qr, { small: true })
     }
-
     if (connection === 'close') {
       botState.status = 'aguardando'
       botState.qrcode = null
@@ -217,7 +298,6 @@ async function iniciarBot() {
       if (reconectar) setTimeout(() => iniciarBot(), 3000)
       else console.log('🔴 Sessão encerrada. Delete auth_info e reinicie.')
     }
-
     if (connection === 'open') {
       botState.status = 'conectado'
       botState.qrcode = null
@@ -229,6 +309,12 @@ async function iniciarBot() {
     if (type !== 'notify') return
     const msg = messages[0]
     if (!msg?.message || msg.key?.fromMe) return
+
+    // ✅ Ignora mensagens antigas (evita duplicação ao reconectar)
+    const timestamp = msg.messageTimestamp
+    const agora = Math.floor(Date.now() / 1000)
+    if (agora - timestamp > 30) return
+
     const jid = msg.key.remoteJid
     if (!jid || jid.endsWith('@g.us')) return
     const texto = extrairTextoMensagem(msg)
@@ -292,20 +378,7 @@ async function iniciarBot() {
   })
 }
 
-// ─── SERVIDOR ─────────────────────────────────────────────────────────────────
-
-function lerLeads() {
-  if (!fs.existsSync(CAMINHO_CSV)) return []
-  const linhas = fs.readFileSync(CAMINHO_CSV, 'utf8').trim().split('\n')
-  if (linhas.length <= 1) return []
-  const cab = linhas[0].split(';').map(c => c.replace(/"/g, '').trim())
-  return linhas.slice(1).map(linha => {
-    const vals = linha.match(/("([^"]|"")*"|[^;]*)/g) || []
-    const obj = {}
-    cab.forEach((c, i) => { obj[c] = (vals[i] || '').replace(/^"|"$/g, '').replace(/""/g, '"').trim() })
-    return obj
-  }).filter(l => l.nome)
-}
+// ─── PÁGINAS HTML ─────────────────────────────────────────────────────────────
 
 function paginaQRCode() {
   const img = botState.qrcode
@@ -318,25 +391,16 @@ function paginaQRCode() {
         </svg>
       </div>`
 
-  const statusLabel = {
-    aguardando: 'Aguardando QR Code…',
-    qrcode: 'Escaneie com o WhatsApp',
-    conectado: 'Bot conectado!'
-  }[botState.status]
-
-  const statusColor = {
-    aguardando: '#ff9f0a',
-    qrcode: '#0071e3',
-    conectado: '#34c759'
-  }[botState.status]
+  const statusLabel = { aguardando: 'Aguardando QR Code…', qrcode: 'Escaneie com o WhatsApp', conectado: 'Bot conectado!' }[botState.status]
+  const statusColor = { aguardando: '#ff9f0a', qrcode: '#0071e3', conectado: '#34c759' }[botState.status]
 
   return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="${botState.status === 'conectado' ? '5;url=/' : '4'}">
-<title>Conectar Bot — Terapia Capilar</title>
+<meta http-equiv="refresh" content="${botState.status === 'conectado' ? '3;url=/' : '4'}">
+<title>Conectar Bot</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -350,8 +414,7 @@ function paginaQRCode() {
   .status-text{font-size:14px;font-weight:500;color:#1d1d1f;vertical-align:middle}
   .hint{font-size:12px;color:#aeaeb2;margin-top:10px;line-height:1.6}
   .success-icon{width:64px;height:64px;background:#e9f8ee;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
-  .btn{display:inline-block;margin-top:20px;padding:10px 24px;background:#1d1d1f;color:#fff;border-radius:20px;font-size:13px;font-weight:500;text-decoration:none;transition:opacity .15s}
-  .btn:hover{opacity:.8}
+  .btn{display:inline-block;margin-top:20px;padding:10px 24px;background:#1d1d1f;color:#fff;border-radius:20px;font-size:13px;font-weight:500;text-decoration:none}
 </style>
 </head>
 <body>
@@ -365,7 +428,6 @@ function paginaQRCode() {
     </div>
     <span class="brand-name">Terapia Capilar</span>
   </div>
-
   ${botState.status === 'conectado' ? `
   <div class="success-icon">
     <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
@@ -377,24 +439,23 @@ function paginaQRCode() {
   <a href="/" class="btn">Ver dashboard</a>
   ` : `
   <div class="qr-wrap">${img}</div>
-  <div>
-    <span class="status-dot"></span>
-    <span class="status-text">${statusLabel}</span>
-  </div>
-  <p class="hint">
-    ${botState.status === 'qrcode'
-      ? 'Abra o WhatsApp → Aparelhos conectados → Conectar aparelho'
-      : 'O QR Code aparecerá em instantes. Esta página atualiza automaticamente.'}
-  </p>
+  <div><span class="status-dot"></span><span class="status-text">${statusLabel}</span></div>
+  <p class="hint">${botState.status === 'qrcode' ? 'Abra o WhatsApp → Aparelhos conectados → Conectar aparelho' : 'O QR Code aparecerá em instantes. Esta página atualiza automaticamente.'}</p>
   `}
 </div>
 </body>
 </html>`
 }
 
-function gerarDashboard(leads) {
-  const total = leads.length
+function gerarDashboard(leads, statusMap, busca) {
+  const termo = (busca || '').trim().toLowerCase()
+  const leadsFiltrados = termo
+    ? leads.filter(l => [l.nome, l.telefone, l.idade, l.dorPrincipal, l.objetivoAtual, l.dataHora].join(' ').toLowerCase().includes(termo))
+    : leads
+
+  const totais = contarPorStatus(leadsFiltrados, statusMap)
   const hoje = new Date().toLocaleDateString('pt-BR')
+
   const contagemDor = {}, contagemObj = {}
   leads.forEach(l => {
     if (l.dorPrincipal) contagemDor[l.dorPrincipal] = (contagemDor[l.dorPrincipal] || 0) + 1
@@ -403,25 +464,41 @@ function gerarDashboard(leads) {
   const dorMaisComum = Object.entries(contagemDor).sort((a,b) => b[1]-a[1])[0]?.[0] || '—'
   const objMaisComum = Object.entries(contagemObj).sort((a,b) => b[1]-a[1])[0]?.[0] || '—'
 
-  const linhas = leads.slice().reverse().map(l => {
-    // Limpa telefone legado que pode conter @lid, @s.whatsapp.net ou outros sufixos
-    const tel = (l.telefone || '').replace(/@.*/g, '').replace(/[^0-9+]/g, '')
-    // Se idade vier com "anos" embutido (dados legados), extrai só o número
-    const idade = (l.idade || '').replace(/[^0-9]/g, '')
+  const linhas = leadsFiltrados.slice().reverse().map(l => {
+    const statusAtual = statusMap[l._id] || 'Novo'
+    const classeStatus = statusAtual === 'Agendado' ? 'status-agendado' : statusAtual === 'Contato feito' ? 'status-contato' : 'status-novo'
     return `
-    <tr data-nome="${escHtml(l.nome)}" data-tel="${escHtml(tel)}" data-nome-original="${escHtml(l.nome)}" data-tel-original="${escHtml(tel)}">
+    <tr>
       <td>
-        <div class="lead-name">${escHtml(l.nome)}</div>
-        <div class="lead-phone">${escHtml(tel) || '—'}</div>
+        <div class="lead-name">${escHtml(l.nome || '-')}</div>
+        <div class="lead-phone">${escHtml(l.telefone || '-')}</div>
       </td>
-      <td><span class="badge">${escHtml(idade) || '—'} anos</span></td>
-      <td>${escHtml(l.dorPrincipal) || '—'}</td>
-      <td>${escHtml(l.intensidade) || '—'}</td>
-      <td>${escHtml(l.tempoProblema) || '—'}</td>
-      <td>${escHtml(l.tratamentoAnterior) || '—'}</td>
-      <td>${escHtml(l.objetivoAtual) || '—'}</td>
-      <td>${escHtml(l.quimica) || '—'}</td>
-      <td class="date-cell">${escHtml(l.dataHora)}</td>
+      <td><span class="badge">${escHtml(l.idade || '-')} anos</span></td>
+      <td>${escHtml(l.dorPrincipal || '-')}</td>
+      <td>${escHtml(l.intensidade || '-')}</td>
+      <td>${escHtml(l.objetivoAtual || '-')}</td>
+      <td>
+        <form method="POST" action="/status">
+          <input type="hidden" name="id" value="${escHtml(l._id)}"/>
+          <input type="hidden" name="busca" value="${escHtml(busca || '')}"/>
+          <select name="status" class="select-status ${classeStatus}" onchange="this.form.submit()">
+            <option value="Novo" ${statusAtual==='Novo'?'selected':''}>Novo</option>
+            <option value="Contato feito" ${statusAtual==='Contato feito'?'selected':''}>Contato feito</option>
+            <option value="Agendado" ${statusAtual==='Agendado'?'selected':''}>Agendado</option>
+          </select>
+        </form>
+      </td>
+      <td>
+        <details>
+          <summary>Ver mais</summary>
+          <div class="detalhes">
+            <p><strong>Tempo:</strong> ${escHtml(l.tempoProblema||'-')}</p>
+            <p><strong>Tratamento anterior:</strong> ${escHtml(l.tratamentoAnterior||'-')}</p>
+            <p><strong>Química:</strong> ${escHtml(l.quimica||'-')}</p>
+            <p><strong>Data:</strong> ${escHtml(l.dataHora||'-')}</p>
+          </div>
+        </details>
+      </td>
     </tr>`
   }).join('')
 
@@ -442,11 +519,11 @@ function gerarDashboard(leads) {
     --bg:#f5f5f7;--surface:#fff;--surface2:#f5f5f7;
     --border:rgba(0,0,0,.08);--border2:rgba(0,0,0,.12);
     --text:#1d1d1f;--text2:#6e6e73;--text3:#aeaeb2;
-    --accent:#0071e3;--success:#34c759;--warn:#ff9f0a;
+    --accent:#0071e3;
     --r-md:12px;--r-lg:16px;
     --sh-sm:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
     --sh-md:0 4px 16px rgba(0,0,0,.08),0 1px 3px rgba(0,0,0,.04);
-    --font:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif;
+    --font:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
   }
   body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
   .topbar{background:rgba(255,255,255,.85);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;padding:0 32px;height:56px;display:flex;align-items:center;justify-content:space-between}
@@ -459,7 +536,7 @@ function gerarDashboard(leads) {
   .bot-status.connected{background:#e9f8ee;color:#1a7a39}
   .bot-status.offline{background:#fff3e0;color:#b35a00;border:1px solid rgba(255,159,10,.3)}
   .bot-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-  .refresh-btn{display:flex;align-items:center;gap:6px;padding:6px 14px;background:var(--surface);border:1px solid var(--border2);border-radius:20px;font-size:13px;font-weight:500;color:var(--text);cursor:pointer;text-decoration:none;font-family:var(--font);transition:background .15s}
+  .refresh-btn{display:flex;align-items:center;gap:6px;padding:6px 14px;background:var(--surface);border:1px solid var(--border2);border-radius:20px;font-size:13px;font-weight:500;color:var(--text);text-decoration:none;transition:background .15s}
   .refresh-btn:hover{background:var(--surface2)}
   .page{max-width:1280px;margin:0 auto;padding:32px 32px 64px}
   .page-header{margin-bottom:32px}
@@ -472,36 +549,34 @@ function gerarDashboard(leads) {
   .metric-value{font-size:32px;font-weight:600;letter-spacing:-1px;line-height:1;margin-bottom:6px}
   .metric-sub{font-size:12px;color:var(--text3)}
   .metric-card.accent{border-color:var(--accent)}.metric-card.accent .metric-value{color:var(--accent)}
-  .search-wrap{position:relative;width:260px}
-  .search-icon{position:absolute;left:11px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--text3);display:flex;align-items:center}
-  .search-input{width:100%;height:34px;padding:0 32px 0 34px;background:var(--surface2);border:1px solid var(--border2);border-radius:20px;font-size:13px;font-family:var(--font);color:var(--text);outline:none;transition:all .15s}
-  .search-input::placeholder{color:var(--text3)}
-  .search-input:focus{background:var(--surface);border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,113,227,.12)}
-  .search-clear{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:var(--text3);border:none;border-radius:50%;width:16px;height:16px;display:none;align-items:center;justify-content:center;cursor:pointer;padding:0;transition:background .15s}
-  .search-clear:hover{background:var(--text2)}.search-clear.visible{display:flex}
+  .busca-form{display:flex;gap:8px;margin-bottom:24px}
+  .busca-input{flex:1;max-width:360px;padding:10px 16px;border:1px solid var(--border2);border-radius:20px;font-size:14px;font-family:var(--font);background:var(--surface);color:var(--text);outline:none;transition:border-color .15s}
+  .busca-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,113,227,.12)}
+  .busca-btn{padding:10px 20px;background:var(--text);color:#fff;border:none;border-radius:20px;font-size:13px;font-weight:500;cursor:pointer;font-family:var(--font)}
+  .busca-limpar{padding:10px 16px;background:var(--surface2);color:var(--text2);border:1px solid var(--border2);border-radius:20px;font-size:13px;font-weight:500;text-decoration:none;display:inline-flex;align-items:center}
   .table-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--sh-sm);overflow:hidden}
   .table-header{padding:18px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
   .table-header-title{font-size:15px;font-weight:600;letter-spacing:-.2px}
   .table-count{font-size:12px;color:var(--text2);background:var(--surface2);padding:3px 10px;border-radius:20px;font-weight:500}
   .table-scroll{overflow-x:auto}
-  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:900px}
   thead th{padding:10px 16px;text-align:left;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;background:var(--surface2);border-bottom:1px solid var(--border);white-space:nowrap}
   tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
   tbody tr:last-child{border-bottom:none}
   tbody tr:hover{background:var(--surface2)}
   tbody td{padding:13px 16px;vertical-align:middle;line-height:1.4}
   .lead-name{font-weight:500;font-size:14px}
-  .lead-phone{font-size:12px;color:var(--text3);margin-top:2px;font-variant-numeric:tabular-nums}
-  .badge{display:inline-block;background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:2px 10px;font-size:12px;font-weight:500;color:var(--text2);white-space:nowrap}
-  .date-cell{color:var(--text3);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .lead-phone{font-size:12px;color:var(--text3);margin-top:2px}
+  .badge{display:inline-block;background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:2px 10px;font-size:12px;font-weight:500;color:var(--text2)}
+  .select-status{border:none;border-radius:999px;padding:7px 14px;font-weight:600;font-size:12px;outline:none;cursor:pointer;font-family:var(--font)}
+  .status-novo{background:#fef3c7;color:#92400e}
+  .status-contato{background:#dbeafe;color:#1d4ed8}
+  .status-agendado{background:#dcfce7;color:#166534}
+  details summary{cursor:pointer;font-size:13px;font-weight:500;color:var(--accent)}
+  .detalhes{margin-top:10px;font-size:13px;color:var(--text2);line-height:1.8}
   .empty-state{padding:80px 24px;text-align:center}
-  .empty-icon{width:48px;height:48px;background:var(--surface2);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
-  .empty-state h3{font-size:17px;font-weight:600;margin-bottom:6px;letter-spacing:-.2px}
+  .empty-state h3{font-size:17px;font-weight:600;margin-bottom:6px}
   .empty-state p{font-size:14px;color:var(--text2);max-width:280px;margin:0 auto;line-height:1.6}
-  .no-results{padding:60px 24px;text-align:center;display:none}
-  .no-results.visible{display:block}
-  .no-results p{font-size:14px;color:var(--text2)}
-  mark{background:#fff3b0;color:inherit;border-radius:2px;padding:0 1px}
   @media(max-width:900px){.metrics{grid-template-columns:repeat(2,1fr)}.page{padding:24px 20px 48px}.topbar{padding:0 20px}}
   @media(max-width:540px){.metrics{grid-template-columns:1fr 1fr;gap:12px}.page-header h1{font-size:22px}}
 </style>
@@ -539,142 +614,119 @@ function gerarDashboard(leads) {
   <div class="metrics">
     <div class="metric-card accent">
       <div class="metric-label">Total de leads</div>
-      <div class="metric-value">${total}</div>
+      <div class="metric-value">${totais.total}</div>
       <div class="metric-sub">pré-atendimentos concluídos</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Queixa mais comum</div>
-      <div class="metric-value" style="font-size:18px;letter-spacing:-.3px;padding-top:6px">${escHtml(dorMaisComum)}</div>
-      <div class="metric-sub">principal demanda</div>
+      <div class="metric-label">Novos</div>
+      <div class="metric-value" style="color:#92400e">${totais.novo}</div>
+      <div class="metric-sub">aguardando contato</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Objetivo mais buscado</div>
-      <div class="metric-value" style="font-size:15px;letter-spacing:-.2px;padding-top:10px;line-height:1.3">${escHtml(objMaisComum)}</div>
-      <div class="metric-sub">entre todos os leads</div>
+      <div class="metric-label">Contato feito</div>
+      <div class="metric-value" style="color:#1d4ed8">${totais.contatoFeito}</div>
+      <div class="metric-sub">em andamento</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Arquivo CSV</div>
-      <div class="metric-value" style="font-size:18px;letter-spacing:-.3px;padding-top:6px">leads.csv</div>
-      <div class="metric-sub">atualizado em tempo real</div>
+      <div class="metric-label">Agendados</div>
+      <div class="metric-value" style="color:#166534">${totais.agendado}</div>
+      <div class="metric-sub">consulta marcada</div>
     </div>
   </div>
+
+  <form class="busca-form" method="GET" action="/">
+    <input class="busca-input" type="text" name="busca" placeholder="Buscar por nome, telefone, dor…" value="${escHtml(busca||'')}"/>
+    <button class="busca-btn" type="submit">Buscar</button>
+    ${busca ? `<a class="busca-limpar" href="/">Limpar</a>` : ''}
+  </form>
 
   <div class="table-card">
     <div class="table-header">
       <span class="table-header-title">Todos os leads</span>
-      <div style="display:flex;align-items:center;gap:12px;">
-        <div class="search-wrap">
-          <span class="search-icon">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.3"/>
-              <path d="M9.5 9.5L12.5 12.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-            </svg>
-          </span>
-          <input id="search-input" class="search-input" type="text" placeholder="Buscar por nome ou telefone…" autocomplete="off" oninput="filtrarLeads(this.value)"/>
-          <button class="search-clear" id="search-clear" onclick="limparBusca()" title="Limpar">
-            <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
-              <path d="M1 1l6 6M7 1L1 7" stroke="white" stroke-width="1.4" stroke-linecap="round"/>
-            </svg>
-          </button>
-        </div>
-        <span class="table-count" id="table-count">${total} ${total === 1 ? 'registro' : 'registros'}</span>
-      </div>
+      <span class="table-count">${leadsFiltrados.length} ${leadsFiltrados.length === 1 ? 'registro' : 'registros'}</span>
     </div>
-
-    ${total === 0 ? `
+    ${leadsFiltrados.length === 0 ? `
     <div class="empty-state">
-      <div class="empty-icon">
-        <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
-          <circle cx="11" cy="7" r="4" stroke="#aeaeb2" stroke-width="1.5"/>
-          <path d="M3 19c0-4.418 3.582-7 8-7s8 2.582 8 7" stroke="#aeaeb2" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
-      </div>
-      <h3>Nenhum lead ainda</h3>
-      <p>Quando alguém concluir o fluxo do chatbot, aparecerá aqui automaticamente.</p>
-    </div>
-    ` : `
+      <h3>${busca ? 'Nenhum resultado encontrado' : 'Nenhum lead ainda'}</h3>
+      <p>${busca ? `Nenhum lead encontrado para "${escHtml(busca)}".` : 'Quando alguém concluir o fluxo do chatbot, aparecerá aqui automaticamente.'}</p>
+    </div>` : `
     <div class="table-scroll">
       <table>
         <thead>
           <tr>
-            <th>Contato</th><th>Idade</th><th>Queixa principal</th><th>Intensidade</th>
-            <th>Tempo do problema</th><th>Tratamento anterior</th><th>Objetivo</th><th>Química</th><th>Data</th>
+            <th>Contato</th><th>Idade</th><th>Queixa principal</th>
+            <th>Intensidade</th><th>Objetivo</th><th>Status</th><th>Detalhes</th>
           </tr>
         </thead>
         <tbody>${linhas}</tbody>
       </table>
-    </div>
-    <div class="no-results" id="no-results">
-      <p>Nenhum resultado para "<strong id="no-results-term"></strong>"</p>
-    </div>
-    `}
+    </div>`}
   </div>
 </div>
-
-<script>
-  function normalizar(str) {
-    return (str||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim()
-  }
-  function highlight(text,term){
-    if(!term)return text
-    var chars='\\^$.|?*+()[]{}'
-    var escaped=term.split('').map(function(c){return chars.indexOf(c)>=0?'\\'+c:c}).join('')
-    return text.replace(new RegExp('('+escaped+')','gi'),'<mark>$1</mark>')
-  }
-  const totalLeads=${total}
-  function filtrarLeads(valor){
-    const termo=normalizar(valor)
-    const rows=document.querySelectorAll('tbody tr')
-    const clearBtn=document.getElementById('search-clear')
-    const counter=document.getElementById('table-count')
-    const noResults=document.getElementById('no-results')
-    const noResultsTerm=document.getElementById('no-results-term')
-    clearBtn.classList.toggle('visible',valor.length>0)
-    let visiveis=0
-    rows.forEach(row=>{
-      const nome=normalizar(row.dataset.nome)
-      const tel=normalizar(row.dataset.tel)
-      if(!termo||nome.includes(termo)||tel.includes(termo)){
-        row.style.display=''
-        if(termo){
-          row.querySelector('.lead-name').innerHTML=highlight(row.dataset.nomeOriginal,valor)
-          row.querySelector('.lead-phone').innerHTML=highlight(row.dataset.telOriginal,valor)
-        }else{
-          row.querySelector('.lead-name').innerHTML=row.dataset.nomeOriginal
-          row.querySelector('.lead-phone').innerHTML=row.dataset.telOriginal
-        }
-        visiveis++
-      }else{row.style.display='none'}
-    })
-    counter.textContent=termo?visiveis+' '+(visiveis===1?'resultado':'resultados'):totalLeads+' '+(totalLeads===1?'registro':'registros')
-    if(noResults){noResultsTerm.textContent=valor;noResults.classList.toggle('visible',visiveis===0&&termo.length>0)}
-  }
-  function limparBusca(){const i=document.getElementById('search-input');i.value='';filtrarLeads('');i.focus()}
-  document.addEventListener('keydown',e=>{
-    if((e.metaKey||e.ctrlKey)&&e.key==='k'){e.preventDefault();document.getElementById('search-input').focus()}
-    if(e.key==='Escape')limparBusca()
-  })
-</script>
 </body>
 </html>`
 }
 
-const server = http.createServer((req, res) => {
-  const url = req.url.split('?')[0]
+// ─── SERVIDOR ─────────────────────────────────────────────────────────────────
 
-  if (url === '/qrcode') {
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let body = ''
+    req.on('data', chunk => { body += chunk.toString() })
+    req.on('end', () => {
+      const params = {}
+      body.split('&').forEach(pair => {
+        const [k, v] = pair.split('=')
+        if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
+      })
+      resolve(params)
+    })
+  })
+}
+
+function parseQuery(url) {
+  const params = {}
+  const qs = url.split('?')[1] || ''
+  qs.split('&').forEach(pair => {
+    const [k, v] = pair.split('=')
+    if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
+  })
+  return params
+}
+
+const server = http.createServer(async (req, res) => {
+  const urlPath = req.url.split('?')[0]
+  const query = parseQuery(req.url)
+
+  if (req.method === 'POST' && urlPath === '/status') {
+    const body = await parseBody(req)
+    const { id, status, busca = '' } = body
+    const permitidos = ['Novo', 'Contato feito', 'Agendado']
+    if (id && status && permitidos.includes(status)) {
+      const statusMap = lerStatus()
+      statusMap[id] = status
+      salvarStatus(statusMap)
+    }
+    const qs = busca ? `?busca=${encodeURIComponent(busca)}` : ''
+    res.writeHead(302, { Location: '/' + qs })
+    res.end()
+    return
+  }
+
+  if (urlPath === '/qrcode') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(paginaQRCode())
-  } else if (url === '/api/status') {
+  } else if (urlPath === '/api/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ status: botState.status }))
-  } else if (url === '/api/leads') {
+  } else if (urlPath === '/api/leads') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(lerLeads()))
-  } else if (url === '/' || url === '/leads') {
+  } else if (urlPath === '/' || urlPath === '/leads') {
     const leads = lerLeads()
+    const statusMap = lerStatus()
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(gerarDashboard(leads))
+    res.end(gerarDashboard(leads, statusMap, query.busca || ''))
   } else {
     res.writeHead(404)
     res.end('Not found')
