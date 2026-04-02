@@ -7,9 +7,17 @@ const {
 const qrcode = require('qrcode-terminal')
 const QRCode = require('qrcode')
 const P = require('pino')
-const fs = require('fs')
-const path = require('path')
 const http = require('http')
+
+const {
+  buscarSessao,
+  criarOuAtualizarSessao,
+  atualizarSessao,
+  removerSessao,
+  salvarLead,
+  atualizarStatusLead,
+  listarLeads
+} = require('./services/database')
 
 // ─── CONFIGURAÇÕES ───────────────────────────────────────────────────────────
 
@@ -26,10 +34,6 @@ Nossa terapeuta capilar vai conseguir te atender com mais direcionamento 💚
 👉 https://calendly.com/SEU_LINK_AQUI
 
 _Se precisar, é só me chamar._ 😊`
-
-const CAMINHO_CSV = path.join(__dirname, 'leads.csv')
-const CAMINHO_ESTADO = path.join(__dirname, 'estado.json')
-const CAMINHO_STATUS = path.join(__dirname, 'lead_status.json')
 
 // ─── ESTADO GLOBAL DO BOT ────────────────────────────────────────────────────
 
@@ -66,18 +70,30 @@ async function enviarPergunta(sock, jid, etapa) {
   await sock.sendMessage(jid, { text: formatarPerguntaComOpcoes(etapa) })
 }
 
-function validarNome(t) { return t.trim().length >= 2 }
-function validarIdade(t) { const n = parseInt(t, 10); return !isNaN(n) && n >= 1 && n <= 120 }
+function validarNome(t) {
+  return t.trim().length >= 2
+}
+
+function validarIdade(t) {
+  const n = parseInt(t, 10)
+  return !isNaN(n) && n >= 1 && n <= 120
+}
 
 function interpretarOpcao(etapa, respostaTexto) {
   if (!etapa.opcoes) return null
+
   const r = normalizarTexto(respostaTexto)
   const num = parseInt(r, 10)
-  if (!isNaN(num) && num >= 1 && num <= etapa.opcoes.length) return etapa.opcoes[num - 1].label
+
+  if (!isNaN(num) && num >= 1 && num <= etapa.opcoes.length) {
+    return etapa.opcoes[num - 1].label
+  }
+
   for (const o of etapa.opcoes) {
     if (r === normalizarTexto(o.label)) return o.label
     if (o.aliases?.some(a => normalizarTexto(a) === r)) return o.label
   }
+
   for (const o of etapa.opcoes) {
     const candidatos = [o.label, ...(o.aliases || [])]
     for (const c of candidatos) {
@@ -85,6 +101,7 @@ function interpretarOpcao(etapa, respostaTexto) {
       if (r.includes(cn) || cn.includes(r)) return o.label
     }
   }
+
   return null
 }
 
@@ -95,166 +112,96 @@ function validarResposta(etapa, texto) {
   return texto.trim().length > 0
 }
 
-function escaparCSV(v = '') { return `"${String(v).replace(/"/g, '""')}"` }
-function formatarDataHora() { return new Date().toLocaleString('pt-BR') }
 function extrairTelefone(jid = '') {
-  return jid.replace(/@.*/g, '').replace(/[^0-9+]/g, '')
-}
-
-function garantirArquivoCSV() {
-  if (!fs.existsSync(CAMINHO_CSV)) {
-    const h = ['dataHora','telefone','nome','idade','dorPrincipal','intensidade','tempoProblema','tratamentoAnterior','objetivoAtual','quimica'].join(';')
-    fs.writeFileSync(CAMINHO_CSV, h + '\n', 'utf8')
-  }
-}
-
-function salvarLeadCSV(jid, r) {
-  garantirArquivoCSV()
-  const linha = [
-    escaparCSV(formatarDataHora()), escaparCSV(extrairTelefone(jid)),
-    escaparCSV(r.nome), escaparCSV(r.idade), escaparCSV(r.dorPrincipal),
-    escaparCSV(r.intensidade), escaparCSV(r.tempoProblema),
-    escaparCSV(r.tratamentoAnterior), escaparCSV(r.objetivoAtual), escaparCSV(r.quimica)
-  ].join(';')
-  fs.appendFileSync(CAMINHO_CSV, linha + '\n', 'utf8')
-  console.log('💾 Lead salvo.')
-}
-
-function carregarEstado() {
-  try { if (fs.existsSync(CAMINHO_ESTADO)) return JSON.parse(fs.readFileSync(CAMINHO_ESTADO, 'utf8')) }
-  catch (e) { console.warn('⚠️ estado.json não encontrado.') }
-  return {}
-}
-
-function salvarEstado(u) {
-  try { fs.writeFileSync(CAMINHO_ESTADO, JSON.stringify(u, null, 2), 'utf8') }
-  catch (e) { console.error('Erro ao salvar estado:', e) }
-}
-
-// ─── FUNÇÕES DE STATUS DE LEAD ───────────────────────────────────────────────
-
-function lerStatus() {
-  try {
-    if (!fs.existsSync(CAMINHO_STATUS)) return {}
-    const conteudo = fs.readFileSync(CAMINHO_STATUS, 'utf8')
-    return conteudo ? JSON.parse(conteudo) : {}
-  } catch (e) {
-    console.error('Erro ao ler lead_status.json:', e)
-    return {}
-  }
-}
-
-function salvarStatus(statusMap) {
-  try {
-    fs.writeFileSync(CAMINHO_STATUS, JSON.stringify(statusMap, null, 2), 'utf8')
-  } catch (e) {
-    console.error('Erro ao salvar lead_status.json:', e)
-  }
-}
-
-// ─── PARSER ROBUSTO DE CSV ───────────────────────────────────────────────────
-
-function parseLinhaCSV(linha) {
-  const valores = []
-  let atual = ''
-  let dentroAspas = false
-  for (let i = 0; i < linha.length; i++) {
-    const char = linha[i]
-    const prox = linha[i + 1]
-    if (char === '"') {
-      if (dentroAspas && prox === '"') { atual += '"'; i++ }
-      else { dentroAspas = !dentroAspas }
-    } else if (char === ';' && !dentroAspas) {
-      valores.push(atual); atual = ''
-    } else { atual += char }
-  }
-  valores.push(atual)
-  return valores
-}
-
-function lerLeads() {
-  try {
-    if (!fs.existsSync(CAMINHO_CSV)) return []
-    const conteudo = fs.readFileSync(CAMINHO_CSV, 'utf8').trim()
-    if (!conteudo) return []
-    const linhas = conteudo.split(/\r?\n/).filter(Boolean)
-    if (linhas.length <= 1) return []
-    const cabecalho = parseLinhaCSV(linhas[0])
-    return linhas.slice(1).map((linha, index) => {
-      const valores = parseLinhaCSV(linha)
-      const lead = {}
-      cabecalho.forEach((col, i) => { lead[col] = valores[i] || '' })
-      // Limpa telefone e idade legados
-      lead.telefone = (lead.telefone || '').replace(/@.*/g, '').replace(/[^0-9+]/g, '')
-      lead.idade = (lead.idade || '').replace(/[^0-9]/g, '')
-      lead._id = `${lead.telefone || 'sem-telefone'}_${lead.dataHora || index}`
-      return lead
-    }).filter(l => l.nome)
-  } catch (e) {
-    console.error('Erro ao ler leads.csv:', e)
-    return []
-  }
+  return String(jid).replace(/@.*/g, '').replace(/[^0-9+]/g, '')
 }
 
 function escHtml(s = '') {
   return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;')
 }
 
-function contarPorStatus(leads, statusMap) {
+function formatarData(data) {
+  if (!data) return '-'
+  return new Date(data).toLocaleString('pt-BR')
+}
+
+function contarPorStatus(leads) {
   const t = { total: leads.length, novo: 0, contatoFeito: 0, agendado: 0 }
+
   for (const lead of leads) {
-    const s = statusMap[lead._id] || 'Novo'
+    const s = lead.status || 'Novo'
     if (s === 'Novo') t.novo++
     if (s === 'Contato feito') t.contatoFeito++
     if (s === 'Agendado') t.agendado++
   }
+
   return t
 }
 
 // ─── FLUXO ───────────────────────────────────────────────────────────────────
 
 const fluxo = [
-  { campo: 'nome', pergunta: '👋 Olá! Seja bem-vindo(a) à *Terapia Capilar* ✨\n\nAntes de começarmos, qual é o seu nome?' },
-  { campo: 'idade', pergunta: 'Pra gente te atender da melhor forma, me conta: qual a sua idade?' },
-  { campo: 'dorPrincipal', pergunta: 'Entendi. Agora me conta uma coisa 👇\n\nQual problema mais tem te incomodado no seu cabelo ultimamente?',
+  {
+    campo: 'nome',
+    pergunta: '👋 Olá! Seja bem-vindo(a) à *Terapia Capilar* ✨\n\nAntes de começarmos, qual é o seu nome?'
+  },
+  {
+    campo: 'idade',
+    pergunta: 'Pra gente te atender da melhor forma, me conta: qual a sua idade?'
+  },
+  {
+    campo: 'dorPrincipal',
+    pergunta: 'Entendi. Agora me conta uma coisa 👇\n\nQual problema mais tem te incomodado no seu cabelo ultimamente?',
     opcoes: [
       { label: 'Queda de cabelo', aliases: ['queda', 'cai muito', 'cabelo caindo', 'queda capilar'] },
       { label: 'Falta de crescimento', aliases: ['nao cresce', 'crescimento', 'demora a crescer'] },
       { label: 'Ressecamento / frizz', aliases: ['ressecamento', 'frizz', 'ressecado', 'seco'] }
     ]
   },
-  { campo: 'intensidade', pergunta: 'E isso tem te incomodado em qual nível?',
+  {
+    campo: 'intensidade',
+    pergunta: 'E isso tem te incomodado em qual nível?',
     opcoes: [
       { label: 'Pouco, mas quero cuidar', aliases: ['pouco', 'leve'] },
       { label: 'Médio, já está me preocupando', aliases: ['medio', 'preocupando', 'me preocupa'] },
       { label: 'Muito, está afetando minha autoestima', aliases: ['muito', 'autoestima', 'bastante'] }
     ]
   },
-  { campo: 'tempoProblema', pergunta: 'Há quanto tempo você percebe esse problema?',
+  {
+    campo: 'tempoProblema',
+    pergunta: 'Há quanto tempo você percebe esse problema?',
     opcoes: [
       { label: 'Menos de 1 mês', aliases: ['menos de 1 mes', 'menos de um mes', 'recente'] },
       { label: 'De 1 a 6 meses', aliases: ['1 a 6 meses', 'alguns meses'] },
       { label: 'Mais de 6 meses', aliases: ['mais de 6 meses', 'muito tempo', 'faz tempo'] }
     ]
   },
-  { campo: 'tratamentoAnterior', pergunta: 'Você já tentou algum tratamento antes?',
+  {
+    campo: 'tratamentoAnterior',
+    pergunta: 'Você já tentou algum tratamento antes?',
     opcoes: [
       { label: 'Sim, com profissional', aliases: ['com profissional', 'clinica'] },
       { label: 'Sim, por conta própria', aliases: ['por conta propria', 'sozinho', 'sozinha', 'em casa'] },
       { label: 'Ainda não, estou buscando ajuda agora', aliases: ['ainda nao', 'primeira vez', 'buscando ajuda'] }
     ]
   },
-  { campo: 'objetivoAtual', pergunta: 'Hoje, o que você mais busca?',
+  {
+    campo: 'objetivoAtual',
+    pergunta: 'Hoje, o que você mais busca?',
     opcoes: [
       { label: 'Resolver o problema de vez', aliases: ['resolver', 'de vez', 'solucionar'] },
       { label: 'Melhorar a aparência do cabelo', aliases: ['melhorar aparencia', 'aparencia'] },
       { label: 'Entender o que está acontecendo', aliases: ['entender', 'descobrir'] }
     ]
   },
-  { campo: 'quimica', pergunta: 'Você faz uso de química nos fios com frequência?',
+  {
+    campo: 'quimica',
+    pergunta: 'Você faz uso de química nos fios com frequência?',
     opcoes: [
       { label: 'Sim, com frequência', aliases: ['sim', 'frequencia', 'uso quimica'] },
       { label: 'Raramente', aliases: ['raramente', 'as vezes', 'de vez em quando'] },
@@ -263,19 +210,15 @@ const fluxo = [
   }
 ]
 
-// ─── ESTADO ───────────────────────────────────────────────────────────────────
-
-let usuarios = carregarEstado()
-
 // ─── BOT ─────────────────────────────────────────────────────────────────────
 
 async function iniciarBot() {
-  garantirArquivoCSV()
   const { state, saveCreds } = await useMultiFileAuthState('auth_info')
   const { version } = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
-    version, auth: state,
+    version,
+    auth: state,
     printQRInTerminal: false,
     logger: P({ level: 'silent' })
   })
@@ -289,15 +232,20 @@ async function iniciarBot() {
       console.log('📱 QR Code disponível em: /qrcode')
       qrcode.generate(qr, { small: true })
     }
+
     if (connection === 'close') {
       botState.status = 'aguardando'
       botState.qrcode = null
+
       const codigo = lastDisconnect?.error?.output?.statusCode
       const reconectar = codigo !== DisconnectReason.loggedOut
+
       console.log('⚠️ Conexão encerrada. Código:', codigo)
+
       if (reconectar) setTimeout(() => iniciarBot(), 3000)
       else console.log('🔴 Sessão encerrada. Delete auth_info e reinicie.')
     }
+
     if (connection === 'open') {
       botState.status = 'conectado'
       botState.qrcode = null
@@ -307,70 +255,103 @@ async function iniciarBot() {
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return
+
     const msg = messages[0]
     if (!msg?.message || msg.key?.fromMe) return
 
-    // ✅ Ignora mensagens antigas (evita duplicação ao reconectar)
-    const timestamp = msg.messageTimestamp
+    const timestamp = Number(msg.messageTimestamp || 0)
     const agora = Math.floor(Date.now() / 1000)
-    if (agora - timestamp > 30) return
+    if (timestamp && agora - timestamp > 30) return
 
     const jid = msg.key.remoteJid
     if (!jid || jid.endsWith('@g.us')) return
+
     const texto = extrairTextoMensagem(msg)
     if (!texto) return
+
     const tn = normalizarTexto(texto)
+    const phone = extrairTelefone(jid)
 
     try {
       if (COMANDOS_REINICIO.includes(tn)) {
-        delete usuarios[jid]
-        salvarEstado(usuarios)
-        await sock.sendMessage(jid, { text: '🔄 Atendimento reiniciado.\n\nPara começar, envie:\n*Olá, quero conhecer a clínica.*' })
+        await removerSessao(phone)
+        await sock.sendMessage(jid, {
+          text: '🔄 Atendimento reiniciado.\n\nPara começar, envie:\n*Olá, quero conhecer a clínica.*'
+        })
         return
       }
 
-      if (!usuarios[jid]) {
+      let sessao = await buscarSessao(phone)
+
+      if (!sessao || !sessao.ativo) {
         if (tn.includes(MENSAGEM_GATILHO)) {
-          usuarios[jid] = { etapa: 0, respostas: {} }
-          salvarEstado(usuarios)
+          await criarOuAtualizarSessao(phone, {
+            etapa: 0,
+            respostas: {},
+            ativo: true
+          })
+
           await enviarPergunta(sock, jid, fluxo[0])
         }
         return
       }
 
-      const eu = usuarios[jid]
-      const etapaAtual = fluxo[eu.etapa]
+      const etapaAtual = fluxo[sessao.etapa]
       if (!etapaAtual) return
 
       if (!validarResposta(etapaAtual, texto)) {
         if (etapaAtual.campo === 'idade') {
-          await sock.sendMessage(jid, { text: 'Por favor, me informe sua idade usando apenas números. Ex.: *35*' })
+          await sock.sendMessage(jid, {
+            text: 'Por favor, me informe sua idade usando apenas números. Ex.: *35*'
+          })
         } else if (etapaAtual.opcoes) {
-          await sock.sendMessage(jid, { text: 'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*' })
+          await sock.sendMessage(jid, {
+            text: 'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*'
+          })
         } else {
-          await sock.sendMessage(jid, { text: 'Pode me responder novamente, por favor?' })
+          await sock.sendMessage(jid, {
+            text: 'Pode me responder novamente, por favor?'
+          })
         }
         return
       }
 
-      eu.respostas[etapaAtual.campo] = etapaAtual.opcoes ? interpretarOpcao(etapaAtual, texto) : texto
-      eu.etapa += 1
-      salvarEstado(usuarios)
+      const respostaFinal = etapaAtual.opcoes
+        ? interpretarOpcao(etapaAtual, texto)
+        : texto
 
-      if (eu.etapa < fluxo.length) {
-        const prox = fluxo[eu.etapa]
+      const respostasAtualizadas = {
+        ...(sessao.respostas || {}),
+        [etapaAtual.campo]: respostaFinal
+      }
+
+      const novaEtapa = sessao.etapa + 1
+
+      await atualizarSessao(phone, {
+        etapa: novaEtapa,
+        respostas: respostasAtualizadas,
+        ativo: novaEtapa < fluxo.length
+      })
+
+      if (novaEtapa < fluxo.length) {
+        const prox = fluxo[novaEtapa]
+
         if (prox.campo === 'idade') {
           await delay(3000)
-          await sock.sendMessage(jid, { text: `Prazer, *${eu.respostas.nome}*! 😊` })
+          await sock.sendMessage(jid, {
+            text: `Prazer, *${respostasAtualizadas.nome}*! 😊`
+          })
         }
+
         await enviarPergunta(sock, jid, prox)
       } else {
-        salvarLeadCSV(jid, eu.respostas)
-        console.log('🆕 Novo lead:', eu.respostas.nome, '|', extrairTelefone(jid))
+        await salvarLead(phone, jid, respostasAtualizadas)
+        console.log('🆕 Novo lead:', respostasAtualizadas.nome, '|', phone)
+
         await delay(3000)
         await sock.sendMessage(jid, { text: MENSAGEM_FINAL })
-        delete usuarios[jid]
-        salvarEstado(usuarios)
+
+        await removerSessao(phone)
       }
     } catch (err) {
       console.error('Erro:', err)
@@ -391,8 +372,17 @@ function paginaQRCode() {
         </svg>
       </div>`
 
-  const statusLabel = { aguardando: 'Aguardando QR Code…', qrcode: 'Escaneie com o WhatsApp', conectado: 'Bot conectado!' }[botState.status]
-  const statusColor = { aguardando: '#ff9f0a', qrcode: '#0071e3', conectado: '#34c759' }[botState.status]
+  const statusLabel = {
+    aguardando: 'Aguardando QR Code…',
+    qrcode: 'Escaneie com o WhatsApp',
+    conectado: 'Bot conectado!'
+  }[botState.status]
+
+  const statusColor = {
+    aguardando: '#ff9f0a',
+    qrcode: '#0071e3',
+    conectado: '#34c759'
+  }[botState.status]
 
   return `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -447,31 +437,46 @@ function paginaQRCode() {
 </html>`
 }
 
-function gerarDashboard(leads, statusMap, busca) {
+function gerarDashboard(leads, busca) {
   const termo = (busca || '').trim().toLowerCase()
+
   const leadsFiltrados = termo
-    ? leads.filter(l => [l.nome, l.telefone, l.idade, l.dorPrincipal, l.objetivoAtual, l.dataHora].join(' ').toLowerCase().includes(termo))
+    ? leads.filter(l =>
+        [l.nome, l.phone, l.idade, l.dorPrincipal, l.objetivoAtual, formatarData(l.createdAt)]
+          .join(' ')
+          .toLowerCase()
+          .includes(termo)
+      )
     : leads
 
-  const totais = contarPorStatus(leadsFiltrados, statusMap)
+  const totais = contarPorStatus(leadsFiltrados)
   const hoje = new Date().toLocaleDateString('pt-BR')
 
-  const contagemDor = {}, contagemObj = {}
+  const contagemDor = {}
+  const contagemObj = {}
+
   leads.forEach(l => {
     if (l.dorPrincipal) contagemDor[l.dorPrincipal] = (contagemDor[l.dorPrincipal] || 0) + 1
     if (l.objetivoAtual) contagemObj[l.objetivoAtual] = (contagemObj[l.objetivoAtual] || 0) + 1
   })
-  const dorMaisComum = Object.entries(contagemDor).sort((a,b) => b[1]-a[1])[0]?.[0] || '—'
-  const objMaisComum = Object.entries(contagemObj).sort((a,b) => b[1]-a[1])[0]?.[0] || '—'
 
-  const linhas = leadsFiltrados.slice().reverse().map(l => {
-    const statusAtual = statusMap[l._id] || 'Novo'
-    const classeStatus = statusAtual === 'Agendado' ? 'status-agendado' : statusAtual === 'Contato feito' ? 'status-contato' : 'status-novo'
+  const dorMaisComum = Object.entries(contagemDor).sort((a, b) => b[1] - a[1])[0]?.[0] || '—'
+  const objMaisComum = Object.entries(contagemObj).sort((a, b) => b[1] - a[1])[0]?.[0] || '—'
+
+  const linhas = leadsFiltrados.map(l => {
+    const statusAtual = l.status || 'Novo'
+    const classeStatus =
+      statusAtual === 'Agendado'
+        ? 'status-agendado'
+        : statusAtual === 'Contato feito'
+          ? 'status-contato'
+          : 'status-novo'
+
     return `
     <tr>
       <td>
         <div class="lead-name">${escHtml(l.nome || '-')}</div>
-        <div class="lead-phone">${escHtml(l.telefone || '-')}</div>
+        <div class="lead-phone">${escHtml(l.phone || '-')}</div>
       </td>
       <td><span class="badge">${escHtml(l.idade || '-')} anos</span></td>
       <td>${escHtml(l.dorPrincipal || '-')}</td>
@@ -479,12 +484,12 @@ function gerarDashboard(leads, statusMap, busca) {
       <td>${escHtml(l.objetivoAtual || '-')}</td>
       <td>
         <form method="POST" action="/status">
-          <input type="hidden" name="id" value="${escHtml(l._id)}"/>
+          <input type="hidden" name="phone" value="${escHtml(l.phone || '')}"/>
           <input type="hidden" name="busca" value="${escHtml(busca || '')}"/>
           <select name="status" class="select-status ${classeStatus}" onchange="this.form.submit()">
-            <option value="Novo" ${statusAtual==='Novo'?'selected':''}>Novo</option>
-            <option value="Contato feito" ${statusAtual==='Contato feito'?'selected':''}>Contato feito</option>
-            <option value="Agendado" ${statusAtual==='Agendado'?'selected':''}>Agendado</option>
+            <option value="Novo" ${statusAtual === 'Novo' ? 'selected' : ''}>Novo</option>
+            <option value="Contato feito" ${statusAtual === 'Contato feito' ? 'selected' : ''}>Contato feito</option>
+            <option value="Agendado" ${statusAtual === 'Agendado' ? 'selected' : ''}>Agendado</option>
           </select>
         </form>
       </td>
@@ -492,10 +497,10 @@ function gerarDashboard(leads, statusMap, busca) {
         <details>
           <summary>Ver mais</summary>
           <div class="detalhes">
-            <p><strong>Tempo:</strong> ${escHtml(l.tempoProblema||'-')}</p>
-            <p><strong>Tratamento anterior:</strong> ${escHtml(l.tratamentoAnterior||'-')}</p>
-            <p><strong>Química:</strong> ${escHtml(l.quimica||'-')}</p>
-            <p><strong>Data:</strong> ${escHtml(l.dataHora||'-')}</p>
+            <p><strong>Tempo:</strong> ${escHtml(l.tempoProblema || '-')}</p>
+            <p><strong>Tratamento anterior:</strong> ${escHtml(l.tratamentoAnterior || '-')}</p>
+            <p><strong>Química:</strong> ${escHtml(l.quimica || '-')}</p>
+            <p><strong>Data:</strong> ${escHtml(formatarData(l.createdAt))}</p>
           </div>
         </details>
       </td>
@@ -585,40 +590,44 @@ function gerarDashboard(leads, statusMap, busca) {
 <nav class="topbar">
   <div class="topbar-brand">
     <div class="topbar-icon">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-        <circle cx="8" cy="5" r="3" fill="white"/>
-        <path d="M2 13c0-3.314 2.686-5 6-5s6 1.686 6 5" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+      <svg width="16" height="16" viewBox="0 0 18 18" fill="none">
+        <circle cx="9" cy="6" r="3.5" fill="white"/>
+        <path d="M2 15c0-3.866 3.134-6 7-6s7 2.134 7 6" stroke="white" stroke-width="1.6" stroke-linecap="round"/>
       </svg>
     </div>
     <span class="topbar-title">Terapia Capilar</span>
   </div>
   <div class="topbar-right">
+    <span class="topbar-date">${hoje}</span>
     ${statusBot}
-    <span class="topbar-date">Atualizado em ${hoje}</span>
-    <a href="/" class="refresh-btn">
-      <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-        <path d="M11.5 6.5A5 5 0 1 1 6.5 1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-        <polyline points="8.5,1 11.5,1 11.5,4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
-      </svg>
-      Atualizar
-    </a>
+    <a href="/" class="refresh-btn">Atualizar</a>
   </div>
 </nav>
 
 <div class="page">
   <div class="page-header">
-    <h1>Leads do Chatbot</h1>
-    <p>Pré-atendimentos coletados automaticamente via WhatsApp</p>
+    <h1>Dashboard de Leads</h1>
+    <p>Acompanhe os pré-atendimentos em tempo real.</p>
   </div>
 
   <div class="metrics">
     <div class="metric-card accent">
       <div class="metric-label">Total de leads</div>
       <div class="metric-value">${totais.total}</div>
-      <div class="metric-sub">pré-atendimentos concluídos</div>
+      <div class="metric-sub">captados até agora</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Novos</div>
+      <div class="metric-label">Queixa mais comum</div>
+      <div class="metric-value" style="font-size:20px;line-height:1.2">${escHtml(dorMaisComum)}</div>
+      <div class="metric-sub">mais recorrente</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Objetivo principal</div>
+      <div class="metric-value" style="font-size:20px;line-height:1.2">${escHtml(objMaisComum)}</div>
+      <div class="metric-sub">mais buscado</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Novos leads</div>
       <div class="metric-value" style="color:#92400e">${totais.novo}</div>
       <div class="metric-sub">aguardando contato</div>
     </div>
@@ -635,7 +644,7 @@ function gerarDashboard(leads, statusMap, busca) {
   </div>
 
   <form class="busca-form" method="GET" action="/">
-    <input class="busca-input" type="text" name="busca" placeholder="Buscar por nome, telefone, dor…" value="${escHtml(busca||'')}"/>
+    <input class="busca-input" type="text" name="busca" placeholder="Buscar por nome, telefone, dor…" value="${escHtml(busca || '')}"/>
     <button class="busca-btn" type="submit">Buscar</button>
     ${busca ? `<a class="busca-limpar" href="/">Limpar</a>` : ''}
   </form>
@@ -700,13 +709,13 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && urlPath === '/status') {
     const body = await parseBody(req)
-    const { id, status, busca = '' } = body
+    const { phone, status, busca = '' } = body
     const permitidos = ['Novo', 'Contato feito', 'Agendado']
-    if (id && status && permitidos.includes(status)) {
-      const statusMap = lerStatus()
-      statusMap[id] = status
-      salvarStatus(statusMap)
+
+    if (phone && status && permitidos.includes(status)) {
+      await atualizarStatusLead(phone, status)
     }
+
     const qs = busca ? `?busca=${encodeURIComponent(busca)}` : ''
     res.writeHead(302, { Location: '/' + qs })
     res.end()
@@ -720,13 +729,13 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ status: botState.status }))
   } else if (urlPath === '/api/leads') {
+    const leads = await listarLeads()
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(lerLeads()))
+    res.end(JSON.stringify(leads))
   } else if (urlPath === '/' || urlPath === '/leads') {
-    const leads = lerLeads()
-    const statusMap = lerStatus()
+    const leads = await listarLeads()
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(gerarDashboard(leads, statusMap, query.busca || ''))
+    res.end(gerarDashboard(leads, query.busca || ''))
   } else {
     res.writeHead(404)
     res.end('Not found')
