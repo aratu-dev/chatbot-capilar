@@ -1,13 +1,5 @@
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys')
-const qrcode = require('qrcode-terminal')
-const QRCode = require('qrcode')
-const P = require('pino')
 const http = require('http')
+const https = require('https')
 
 const {
   buscarSessao,
@@ -25,6 +17,10 @@ const MENSAGEM_GATILHO = 'quero conhecer a clinica'
 const COMANDOS_REINICIO = ['menu', 'reiniciar', 'comecar', 'começar']
 const PORT = process.env.PORT || 3000
 
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID
+
 const MENSAGEM_FINAL = `✅ *Perfeito!* Já tenho informações suficientes para o seu pré-atendimento.
 
 Nossa terapeuta capilar vai conseguir te atender com mais direcionamento 💚
@@ -35,43 +31,25 @@ Nossa terapeuta capilar vai conseguir te atender com mais direcionamento 💚
 
 _Se precisar, é só me chamar._ 😊`
 
-// ─── ESTADO GLOBAL DO BOT ────────────────────────────────────────────────────
-
 const botState = {
-  status: 'aguardando',
+  status: 'cloud_api',
   qrcode: null
 }
 
-// ─── FUNÇÕES AUXILIARES DO BOT ───────────────────────────────────────────────
+// ─── FUNÇÕES AUXILIARES ──────────────────────────────────────────────────────
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 function normalizarTexto(texto = '') {
-  return texto.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase()
-}
-
-function extrairTextoMensagem(msg) {
-  return (
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.imageMessage?.caption ||
-    ''
-  ).trim()
-}
-
-function formatarPerguntaComOpcoes(etapa) {
-  if (!etapa.opcoes || etapa.opcoes.length === 0) return etapa.pergunta
-  const lista = etapa.opcoes.map((o, i) => `${i + 1} - ${o.label}`).join('\n')
-  return `${etapa.pergunta}\n\n${lista}`
-}
-
-async function enviarPergunta(sock, jid, etapa) {
-  await delay(3000)
-  await sock.sendMessage(jid, { text: formatarPerguntaComOpcoes(etapa) })
+  return String(texto)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
 }
 
 function validarNome(t) {
-  return t.trim().length >= 2
+  return String(t).trim().length >= 2
 }
 
 function validarIdade(t) {
@@ -109,11 +87,13 @@ function validarResposta(etapa, texto) {
   if (etapa.campo === 'nome') return validarNome(texto)
   if (etapa.campo === 'idade') return validarIdade(texto)
   if (etapa.opcoes) return interpretarOpcao(etapa, texto) !== null
-  return texto.trim().length > 0
+  return String(texto).trim().length > 0
 }
 
-function extrairTelefone(jid = '') {
-  return String(jid).replace(/@.*/g, '').replace(/[^0-9+]/g, '')
+function formatarPerguntaComOpcoes(etapa) {
+  if (!etapa.opcoes || etapa.opcoes.length === 0) return etapa.pergunta
+  const lista = etapa.opcoes.map((o, i) => `${i + 1} - ${o.label}`).join('\n')
+  return `${etapa.pergunta}\n\n${lista}`
 }
 
 function escHtml(s = '') {
@@ -141,6 +121,236 @@ function contarPorStatus(leads) {
   }
 
   return t
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = ''
+
+    req.on('data', chunk => {
+      body += chunk.toString()
+    })
+
+    req.on('end', () => {
+      resolve(body)
+    })
+
+    req.on('error', reject)
+  })
+}
+
+function parseFormBody(rawBody = '') {
+  const params = {}
+
+  rawBody.split('&').forEach(pair => {
+    const [k, v] = pair.split('=')
+    if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
+  })
+
+  return params
+}
+
+function parseQuery(url) {
+  const params = {}
+  const qs = url.split('?')[1] || ''
+
+  qs.split('&').forEach(pair => {
+    const [k, v] = pair.split('=')
+    if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
+  })
+
+  return params
+}
+
+function responderJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(payload))
+}
+
+function responderTexto(res, statusCode, texto) {
+  res.writeHead(statusCode, { 'Content-Type': 'text/plain; charset=utf-8' })
+  res.end(texto)
+}
+
+// ─── WHATSAPP CLOUD API ──────────────────────────────────────────────────────
+
+async function enviarMensagemWhatsApp(numero, texto) {
+  if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
+    throw new Error('WHATSAPP_TOKEN ou WHATSAPP_PHONE_NUMBER_ID não configurado.')
+  }
+
+  const body = JSON.stringify({
+    messaging_product: 'whatsapp',
+    to: numero,
+    type: 'text',
+    text: { body: texto }
+  })
+
+  const options = {
+    hostname: 'graph.facebook.com',
+    path: `/v23.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (apiRes) => {
+      let data = ''
+
+      apiRes.on('data', chunk => {
+        data += chunk
+      })
+
+      apiRes.on('end', () => {
+        if (apiRes.statusCode >= 200 && apiRes.statusCode < 300) {
+          resolve(data)
+        } else {
+          reject(new Error(`Erro ${apiRes.statusCode}: ${data}`))
+        }
+      })
+    })
+
+    req.on('error', reject)
+    req.write(body)
+    req.end()
+  })
+}
+
+async function enviarPergunta(numero, etapa) {
+  await delay(3000)
+  await enviarMensagemWhatsApp(numero, formatarPerguntaComOpcoes(etapa))
+}
+
+function extrairEventosWhatsApp(payload) {
+  const eventos = []
+
+  const entries = payload?.entry || []
+  for (const entry of entries) {
+    const changes = entry?.changes || []
+    for (const change of changes) {
+      const value = change?.value || {}
+      const messages = value?.messages || []
+
+      for (const message of messages) {
+        const from = message?.from
+        if (!from) continue
+
+        let texto = ''
+
+        if (message.type === 'text') {
+          texto = message.text?.body || ''
+        } else if (message.type === 'button') {
+          texto = message.button?.text || ''
+        } else if (message.type === 'interactive') {
+          texto =
+            message.interactive?.button_reply?.title ||
+            message.interactive?.list_reply?.title ||
+            ''
+        }
+
+        if (!texto) continue
+
+        eventos.push({
+          from,
+          texto: String(texto).trim(),
+          messageId: message.id || null
+        })
+      }
+    }
+  }
+
+  return eventos
+}
+
+async function processarMensagemWhatsApp(numero, texto) {
+  const tn = normalizarTexto(texto)
+
+  if (COMANDOS_REINICIO.includes(tn)) {
+    await removerSessao(numero)
+    await enviarMensagemWhatsApp(
+      numero,
+      '🔄 Atendimento reiniciado.\n\nPara começar, envie:\n*Olá, quero conhecer a clínica.*'
+    )
+    return
+  }
+
+  let sessao = await buscarSessao(numero)
+
+  if (!sessao || !sessao.ativo) {
+    if (tn.includes(MENSAGEM_GATILHO)) {
+      await criarOuAtualizarSessao(numero, {
+        etapa: 0,
+        respostas: {},
+        ativo: true
+      })
+
+      await enviarPergunta(numero, fluxo[0])
+    }
+    return
+  }
+
+  const etapaAtual = fluxo[sessao.etapa]
+  if (!etapaAtual) return
+
+  if (!validarResposta(etapaAtual, texto)) {
+    if (etapaAtual.campo === 'idade') {
+      await enviarMensagemWhatsApp(
+        numero,
+        'Por favor, me informe sua idade usando apenas números. Ex.: *35*'
+      )
+    } else if (etapaAtual.opcoes) {
+      await enviarMensagemWhatsApp(
+        numero,
+        'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*'
+      )
+    } else {
+      await enviarMensagemWhatsApp(
+        numero,
+        'Pode me responder novamente, por favor?'
+      )
+    }
+    return
+  }
+
+  const respostaFinal = etapaAtual.opcoes
+    ? interpretarOpcao(etapaAtual, texto)
+    : texto
+
+  const respostasAtualizadas = {
+    ...(sessao.respostas || {}),
+    [etapaAtual.campo]: respostaFinal
+  }
+
+  const novaEtapa = sessao.etapa + 1
+
+  await atualizarSessao(numero, {
+    etapa: novaEtapa,
+    respostas: respostasAtualizadas,
+    ativo: novaEtapa < fluxo.length
+  })
+
+  if (novaEtapa < fluxo.length) {
+    const prox = fluxo[novaEtapa]
+
+    if (prox.campo === 'idade') {
+      await delay(3000)
+      await enviarMensagemWhatsApp(numero, `Prazer, *${respostasAtualizadas.nome}*! 😊`)
+    }
+
+    await enviarPergunta(numero, prox)
+  } else {
+    await salvarLead(numero, numero, respostasAtualizadas)
+    console.log('🆕 Novo lead:', respostasAtualizadas.nome, '|', numero)
+
+    await delay(3000)
+    await enviarMensagemWhatsApp(numero, MENSAGEM_FINAL)
+
+    await removerSessao(numero)
+  }
 }
 
 // ─── FLUXO ───────────────────────────────────────────────────────────────────
@@ -210,229 +420,28 @@ const fluxo = [
   }
 ]
 
-// ─── BOT ─────────────────────────────────────────────────────────────────────
-
-async function iniciarBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_' + Date.now())
-  const { version } = await fetchLatestBaileysVersion()
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    logger: P({ level: 'silent' })
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      botState.status = 'qrcode'
-      botState.qrcode = await QRCode.toDataURL(qr)
-      console.log('📱 QR Code disponível em: /qrcode')
-      qrcode.generate(qr, { small: true })
-    }
-
-    if (connection === 'close') {
-      botState.status = 'aguardando'
-      botState.qrcode = null
-
-      const codigo = lastDisconnect?.error?.output?.statusCode
-      const reconectar = codigo !== DisconnectReason.loggedOut
-
-      console.log('⚠️ Conexão encerrada. Código:', codigo)
-
-      if (reconectar) setTimeout(() => iniciarBot(), 3000)
-      else console.log('🔴 Sessão encerrada. Delete auth_info e reinicie.')
-    }
-
-    if (connection === 'open') {
-      botState.status = 'conectado'
-      botState.qrcode = null
-      console.log('✅ Bot conectado!')
-    }
-  })
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return
-
-    const msg = messages[0]
-    if (!msg?.message || msg.key?.fromMe) return
-
-    const timestamp = Number(msg.messageTimestamp || 0)
-    const agora = Math.floor(Date.now() / 1000)
-    if (timestamp && agora - timestamp > 30) return
-
-    const jid = msg.key.remoteJid
-    if (!jid || jid.endsWith('@g.us')) return
-
-    const texto = extrairTextoMensagem(msg)
-    if (!texto) return
-
-    const tn = normalizarTexto(texto)
-    const phone = extrairTelefone(jid)
-
-    try {
-      if (COMANDOS_REINICIO.includes(tn)) {
-        await removerSessao(phone)
-        await sock.sendMessage(jid, {
-          text: '🔄 Atendimento reiniciado.\n\nPara começar, envie:\n*Olá, quero conhecer a clínica.*'
-        })
-        return
-      }
-
-      let sessao = await buscarSessao(phone)
-
-      if (!sessao || !sessao.ativo) {
-        if (tn.includes(MENSAGEM_GATILHO)) {
-          await criarOuAtualizarSessao(phone, {
-            etapa: 0,
-            respostas: {},
-            ativo: true
-          })
-
-          await enviarPergunta(sock, jid, fluxo[0])
-        }
-        return
-      }
-
-      const etapaAtual = fluxo[sessao.etapa]
-      if (!etapaAtual) return
-
-      if (!validarResposta(etapaAtual, texto)) {
-        if (etapaAtual.campo === 'idade') {
-          await sock.sendMessage(jid, {
-            text: 'Por favor, me informe sua idade usando apenas números. Ex.: *35*'
-          })
-        } else if (etapaAtual.opcoes) {
-          await sock.sendMessage(jid, {
-            text: 'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*'
-          })
-        } else {
-          await sock.sendMessage(jid, {
-            text: 'Pode me responder novamente, por favor?'
-          })
-        }
-        return
-      }
-
-      const respostaFinal = etapaAtual.opcoes
-        ? interpretarOpcao(etapaAtual, texto)
-        : texto
-
-      const respostasAtualizadas = {
-        ...(sessao.respostas || {}),
-        [etapaAtual.campo]: respostaFinal
-      }
-
-      const novaEtapa = sessao.etapa + 1
-
-      await atualizarSessao(phone, {
-        etapa: novaEtapa,
-        respostas: respostasAtualizadas,
-        ativo: novaEtapa < fluxo.length
-      })
-
-      if (novaEtapa < fluxo.length) {
-        const prox = fluxo[novaEtapa]
-
-        if (prox.campo === 'idade') {
-          await delay(3000)
-          await sock.sendMessage(jid, {
-            text: `Prazer, *${respostasAtualizadas.nome}*! 😊`
-          })
-        }
-
-        await enviarPergunta(sock, jid, prox)
-      } else {
-        await salvarLead(phone, jid, respostasAtualizadas)
-        console.log('🆕 Novo lead:', respostasAtualizadas.nome, '|', phone)
-
-        await delay(3000)
-        await sock.sendMessage(jid, { text: MENSAGEM_FINAL })
-
-        await removerSessao(phone)
-      }
-    } catch (err) {
-      console.error('Erro:', err)
-    }
-  })
-}
-
 // ─── PÁGINAS HTML ─────────────────────────────────────────────────────────────
 
-function paginaQRCode() {
-  const img = botState.qrcode
-    ? `<img src="${botState.qrcode}" alt="QR Code" style="width:220px;height:220px;border-radius:12px;">`
-    : `<div style="width:220px;height:220px;background:#f5f5f7;border-radius:12px;display:flex;align-items:center;justify-content:center;">
-        <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
-          <circle cx="20" cy="20" r="18" stroke="#aeaeb2" stroke-width="2"/>
-          <path d="M20 12v4M20 24v4" stroke="#aeaeb2" stroke-width="2" stroke-linecap="round"/>
-          <circle cx="20" cy="20" r="2" fill="#aeaeb2"/>
-        </svg>
-      </div>`
-
-  const statusLabel = {
-    aguardando: 'Aguardando QR Code…',
-    qrcode: 'Escaneie com o WhatsApp',
-    conectado: 'Bot conectado!'
-  }[botState.status]
-
-  const statusColor = {
-    aguardando: '#ff9f0a',
-    qrcode: '#0071e3',
-    conectado: '#34c759'
-  }[botState.status]
-
+function paginaWebhook() {
   return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="${botState.status === 'conectado' ? '3;url=/' : '4'}">
-<title>Conectar Bot</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<title>WhatsApp Cloud API</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Inter',-apple-system,sans-serif;background:#f5f5f7;min-height:100vh;display:flex;align-items:center;justify-content:center;-webkit-font-smoothing:antialiased}
-  .card{background:#fff;border-radius:20px;padding:40px 36px;width:340px;text-align:center;border:1px solid rgba(0,0,0,0.08);box-shadow:0 4px 24px rgba(0,0,0,0.08)}
-  .brand{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:28px}
-  .brand-icon{width:32px;height:32px;background:#1d1d1f;border-radius:8px;display:flex;align-items:center;justify-content:center}
-  .brand-name{font-size:15px;font-weight:600;color:#1d1d1f}
-  .qr-wrap{display:flex;align-items:center;justify-content:center;margin-bottom:24px}
-  .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};margin-right:7px;vertical-align:middle}
-  .status-text{font-size:14px;font-weight:500;color:#1d1d1f;vertical-align:middle}
-  .hint{font-size:12px;color:#aeaeb2;margin-top:10px;line-height:1.6}
-  .success-icon{width:64px;height:64px;background:#e9f8ee;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
-  .btn{display:inline-block;margin-top:20px;padding:10px 24px;background:#1d1d1f;color:#fff;border-radius:20px;font-size:13px;font-weight:500;text-decoration:none}
+  body{font-family:Arial,sans-serif;background:#f5f5f7;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .card{background:#fff;padding:32px;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,.08);max-width:520px;text-align:center}
+  h1{margin-top:0}
+  code{background:#f1f1f4;padding:4px 8px;border-radius:8px}
 </style>
 </head>
 <body>
-<div class="card">
-  <div class="brand">
-    <div class="brand-icon">
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-        <circle cx="9" cy="6" r="3.5" fill="white"/>
-        <path d="M2 15c0-3.866 3.134-6 7-6s7 2.134 7 6" stroke="white" stroke-width="1.6" stroke-linecap="round"/>
-      </svg>
-    </div>
-    <span class="brand-name">Terapia Capilar</span>
+  <div class="card">
+    <h1>WhatsApp Cloud API ativa ✅</h1>
+    <p>Webhook pronto para verificação e recebimento de mensagens.</p>
+    <p>Use <code>/webhook</code> na configuração da Meta.</p>
   </div>
-  ${botState.status === 'conectado' ? `
-  <div class="success-icon">
-    <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-      <path d="M6 14l5.5 5.5L22 8" stroke="#34c759" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-  </div>
-  <div class="status-text" style="font-size:17px;font-weight:600;">Bot conectado!</div>
-  <p class="hint" style="margin-top:8px;">Redirecionando para o dashboard…</p>
-  <a href="/" class="btn">Ver dashboard</a>
-  ` : `
-  <div class="qr-wrap">${img}</div>
-  <div><span class="status-dot"></span><span class="status-text">${statusLabel}</span></div>
-  <p class="hint">${botState.status === 'qrcode' ? 'Abra o WhatsApp → Aparelhos conectados → Conectar aparelho' : 'O QR Code aparecerá em instantes. Esta página atualiza automaticamente.'}</p>
-  `}
-</div>
 </body>
 </html>`
 }
@@ -507,10 +516,6 @@ function gerarDashboard(leads, busca) {
     </tr>`
   }).join('')
 
-  const statusBot = botState.status === 'conectado'
-    ? `<span class="bot-status connected"><span class="dot"></span>Bot online</span>`
-    : `<a href="/qrcode" class="bot-status offline"><span class="dot"></span>Bot offline — conectar</a>`
-
   return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -537,9 +542,7 @@ function gerarDashboard(leads, busca) {
   .topbar-title{font-size:15px;font-weight:600;letter-spacing:-.2px}
   .topbar-right{display:flex;align-items:center;gap:12px}
   .topbar-date{font-size:13px;color:var(--text2)}
-  .bot-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:5px 12px;border-radius:20px;text-decoration:none}
-  .bot-status.connected{background:#e9f8ee;color:#1a7a39}
-  .bot-status.offline{background:#fff3e0;color:#b35a00;border:1px solid rgba(255,159,10,.3)}
+  .bot-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:5px 12px;border-radius:20px;text-decoration:none;background:#e9f8ee;color:#1a7a39}
   .bot-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
   .refresh-btn{display:flex;align-items:center;gap:6px;padding:6px 14px;background:var(--surface);border:1px solid var(--border2);border-radius:20px;font-size:13px;font-weight:500;color:var(--text);text-decoration:none;transition:background .15s}
   .refresh-btn:hover{background:var(--surface2)}
@@ -547,7 +550,7 @@ function gerarDashboard(leads, busca) {
   .page-header{margin-bottom:32px}
   .page-header h1{font-size:28px;font-weight:600;letter-spacing:-.5px;margin-bottom:4px}
   .page-header p{font-size:15px;color:var(--text2)}
-  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
+  .metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;margin-bottom:32px}
   .metric-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:20px 22px;box-shadow:var(--sh-sm);transition:box-shadow .2s}
   .metric-card:hover{box-shadow:var(--sh-md)}
   .metric-label{font-size:12px;font-weight:500;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
@@ -582,7 +585,8 @@ function gerarDashboard(leads, busca) {
   .empty-state{padding:80px 24px;text-align:center}
   .empty-state h3{font-size:17px;font-weight:600;margin-bottom:6px}
   .empty-state p{font-size:14px;color:var(--text2);max-width:280px;margin:0 auto;line-height:1.6}
-  @media(max-width:900px){.metrics{grid-template-columns:repeat(2,1fr)}.page{padding:24px 20px 48px}.topbar{padding:0 20px}}
+  @media(max-width:1100px){.metrics{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:900px){.page{padding:24px 20px 48px}.topbar{padding:0 20px}}
   @media(max-width:540px){.metrics{grid-template-columns:1fr 1fr;gap:12px}.page-header h1{font-size:22px}}
 </style>
 </head>
@@ -599,7 +603,7 @@ function gerarDashboard(leads, busca) {
   </div>
   <div class="topbar-right">
     <span class="topbar-date">${hoje}</span>
-    ${statusBot}
+    <span class="bot-status"><span class="dot"></span>Cloud API ativa</span>
     <a href="/" class="refresh-btn">Atualizar</a>
   </div>
 </nav>
@@ -678,67 +682,107 @@ function gerarDashboard(leads, busca) {
 
 // ─── SERVIDOR ─────────────────────────────────────────────────────────────────
 
-function parseBody(req) {
-  return new Promise((resolve) => {
-    let body = ''
-    req.on('data', chunk => { body += chunk.toString() })
-    req.on('end', () => {
-      const params = {}
-      body.split('&').forEach(pair => {
-        const [k, v] = pair.split('=')
-        if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
-      })
-      resolve(params)
-    })
-  })
-}
-
-function parseQuery(url) {
-  const params = {}
-  const qs = url.split('?')[1] || ''
-  qs.split('&').forEach(pair => {
-    const [k, v] = pair.split('=')
-    if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
-  })
-  return params
-}
-
 const server = http.createServer(async (req, res) => {
   const urlPath = req.url.split('?')[0]
   const query = parseQuery(req.url)
 
-  if (req.method === 'POST' && urlPath === '/status') {
-    const body = await parseBody(req)
-    const { phone, status, busca = '' } = body
-    const permitidos = ['Novo', 'Contato feito', 'Agendado']
+  try {
+    if (req.method === 'GET' && urlPath === '/webhook') {
+      const mode = query['hub.mode']
+      const token = query['hub.verify_token']
+      const challenge = query['hub.challenge']
 
-    if (phone && status && permitidos.includes(status)) {
-      await atualizarStatusLead(phone, status)
+      if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+        responderTexto(res, 200, challenge || '')
+      } else {
+        responderTexto(res, 403, 'Forbidden')
+      }
+      return
     }
 
-    const qs = busca ? `?busca=${encodeURIComponent(busca)}` : ''
-    res.writeHead(302, { Location: '/' + qs })
-    res.end()
-    return
-  }
+    if (req.method === 'POST' && urlPath === '/webhook') {
+      const rawBody = await parseBody(req)
+      let payload = {}
 
-  if (urlPath === '/qrcode') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(paginaQRCode())
-  } else if (urlPath === '/api/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ status: botState.status }))
-  } else if (urlPath === '/api/leads') {
-    const leads = await listarLeads()
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(leads))
-  } else if (urlPath === '/' || urlPath === '/leads') {
-    const leads = await listarLeads()
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(gerarDashboard(leads, query.busca || ''))
-  } else {
-    res.writeHead(404)
-    res.end('Not found')
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : {}
+      } catch {
+        responderJson(res, 400, { ok: false, error: 'JSON inválido' })
+        return
+      }
+
+      const eventos = extrairEventosWhatsApp(payload)
+
+      for (const evento of eventos) {
+        await processarMensagemWhatsApp(evento.from, evento.texto)
+      }
+
+      responderJson(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'GET' && urlPath === '/teste-envio') {
+      const numero = query.numero
+
+      if (!numero) {
+        responderTexto(res, 400, 'Informe ?numero=55DDDNUMERO')
+        return
+      }
+
+      const resultado = await enviarMensagemWhatsApp(
+        numero,
+        'Teste enviado pela WhatsApp Cloud API 🚀'
+      )
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(resultado)
+      return
+    }
+
+    if (req.method === 'POST' && urlPath === '/status') {
+      const rawBody = await parseBody(req)
+      const body = parseFormBody(rawBody)
+      const { phone, status, busca = '' } = body
+      const permitidos = ['Novo', 'Contato feito', 'Agendado']
+
+      if (phone && status && permitidos.includes(status)) {
+        await atualizarStatusLead(phone, status)
+      }
+
+      const qs = busca ? `?busca=${encodeURIComponent(busca)}` : ''
+      res.writeHead(302, { Location: '/' + qs })
+      res.end()
+      return
+    }
+
+    if (urlPath === '/api/status') {
+      responderJson(res, 200, { status: botState.status })
+      return
+    }
+
+    if (urlPath === '/api/leads') {
+      const leads = await listarLeads()
+      responderJson(res, 200, leads)
+      return
+    }
+
+    if (urlPath === '/webhook-info') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(paginaWebhook())
+      return
+    }
+
+    if (urlPath === '/' || urlPath === '/leads') {
+      const leads = await listarLeads()
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(gerarDashboard(leads, query.busca || ''))
+      return
+    }
+
+    responderTexto(res, 404, 'Not found')
+  } catch (error) {
+    console.error('Erro no servidor:', error)
+    responderTexto(res, 500, error.message || 'Erro interno')
   }
 })
 
@@ -746,8 +790,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`\n✅ Servidor rodando na porta ${PORT}`)
-  console.log(`📊 Dashboard:  http://localhost:${PORT}`)
-  console.log(`📱 QR Code:    http://localhost:${PORT}/qrcode\n`)
+  console.log(`📊 Dashboard:       http://localhost:${PORT}`)
+  console.log(`🔗 Webhook info:    http://localhost:${PORT}/webhook-info`)
+  console.log(`🧪 Teste de envio:  http://localhost:${PORT}/teste-envio?numero=55DDDNUMERO`)
+  console.log(`📩 Webhook Meta:    http://localhost:${PORT}/webhook\n`)
 })
-
-iniciarBot()
