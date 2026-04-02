@@ -692,6 +692,13 @@ const server = http.createServer(async (req, res) => {
       const token = query['hub.verify_token']
       const challenge = query['hub.challenge']
 
+      console.log('--- WEBHOOK VERIFY ---')
+      console.log('mode:', mode)
+      console.log('token recebido:', token)
+      console.log('challenge:', challenge)
+      console.log('token esperado:', VERIFY_TOKEN)
+      console.log('----------------------')
+
       if (mode === 'subscribe' && token === VERIFY_TOKEN) {
         responderTexto(res, 200, challenge || '')
       } else {
