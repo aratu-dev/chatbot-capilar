@@ -1,6 +1,6 @@
-node_modules
+node_modules/
 .env
-auth_info
+auth_info/
 leads.csv
 lead_status.json
 estado.json
