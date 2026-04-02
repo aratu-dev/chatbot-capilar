@@ -213,7 +213,7 @@ const fluxo = [
 // ─── BOT ─────────────────────────────────────────────────────────────────────
 
 async function iniciarBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_' + Date.now())
   const { version } = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
