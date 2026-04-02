@@ -690,8 +690,9 @@ const server = http.createServer(async (req, res) => {
     if (urlPath === '/ping-meta') {
       console.log('PING META ACESSADO')
       responderTexto(res, 200, 'ok')
-    return
-  }
+      return
+    }
+
     if (req.method === 'GET' && urlPath === '/webhook') {
       const mode = query['hub.mode']
       const token = query['hub.verify_token']
@@ -703,6 +704,11 @@ const server = http.createServer(async (req, res) => {
       console.log('challenge:', challenge)
       console.log('token esperado:', VERIFY_TOKEN)
       console.log('----------------------')
+
+      if (!mode && !token && !challenge) {
+        responderTexto(res, 200, 'Webhook online')
+        return
+      }
 
       if (mode === 'subscribe' && token === VERIFY_TOKEN) {
         responderTexto(res, 200, challenge || '')
@@ -796,6 +802,11 @@ const server = http.createServer(async (req, res) => {
     console.error('Erro no servidor:', error)
     responderTexto(res, 500, error.message || 'Erro interno')
   }
+})
+
+// LOG GLOBAL DE TODAS AS REQUISIÇÕES
+server.on('request', (req) => {
+  console.log(`→ ${req.method} ${req.url} | UA: ${req.headers['user-agent']}`)
 })
 
 // ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
