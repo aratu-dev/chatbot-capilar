@@ -687,6 +687,11 @@ const server = http.createServer(async (req, res) => {
   const query = parseQuery(req.url)
 
   try {
+    if (urlPath === '/ping-meta') {
+      console.log('PING META ACESSADO')
+      responderTexto(res, 200, 'ok')
+    return
+  }
     if (req.method === 'GET' && urlPath === '/webhook') {
       const mode = query['hub.mode']
       const token = query['hub.verify_token']
