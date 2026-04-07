@@ -17,9 +17,13 @@ const MENSAGEM_GATILHO = 'quero conhecer a clinica'
 const COMANDOS_REINICIO = ['menu', 'reiniciar', 'comecar', 'começar']
 const PORT = process.env.PORT || 3000
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN
-const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID
+// Evolution API — configure estas variáveis no Railway
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL         // Ex: https://evolution.seudominio.com
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY         // Chave gerada na Evolution API
+const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE       // Nome da instância criada (ex: "terapia-capilar")
+
+// Token de segurança para verificar que o webhook veio da Evolution API
+const EVOLUTION_WEBHOOK_TOKEN = process.env.EVOLUTION_WEBHOOK_TOKEN || ''
 
 const MENSAGEM_FINAL = `✅ *Perfeito!* Já tenho informações suficientes para o seu pré-atendimento.
 
@@ -31,10 +35,12 @@ Nossa terapeuta capilar vai conseguir te atender com mais direcionamento 💚
 
 _Se precisar, é só me chamar._ 😊`
 
-const botState = {
-  status: 'cloud_api',
-  qrcode: null
-}
+// Proteção contra mensagens duplicadas (Evolution pode reenviar o webhook)
+// Guarda os últimos 500 IDs de mensagens processadas em memória
+const mensagensProcessadas = new Set()
+const MAX_IDS_CACHE = 500
+
+const botState = { status: 'evolution_api' }
 
 // ─── FUNÇÕES AUXILIARES ──────────────────────────────────────────────────────
 
@@ -112,53 +118,40 @@ function formatarData(data) {
 
 function contarPorStatus(leads) {
   const t = { total: leads.length, novo: 0, contatoFeito: 0, agendado: 0 }
-
   for (const lead of leads) {
     const s = lead.status || 'Novo'
     if (s === 'Novo') t.novo++
     if (s === 'Contato feito') t.contatoFeito++
     if (s === 'Agendado') t.agendado++
   }
-
   return t
 }
 
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = ''
-
-    req.on('data', chunk => {
-      body += chunk.toString()
-    })
-
-    req.on('end', () => {
-      resolve(body)
-    })
-
+    req.on('data', chunk => { body += chunk.toString() })
+    req.on('end', () => { resolve(body) })
     req.on('error', reject)
   })
 }
 
 function parseFormBody(rawBody = '') {
   const params = {}
-
   rawBody.split('&').forEach(pair => {
     const [k, v] = pair.split('=')
     if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
   })
-
   return params
 }
 
 function parseQuery(url) {
   const params = {}
   const qs = url.split('?')[1] || ''
-
   qs.split('&').forEach(pair => {
     const [k, v] = pair.split('=')
     if (k) params[decodeURIComponent(k)] = decodeURIComponent((v || '').replace(/\+/g, ' '))
   })
-
   return params
 }
 
@@ -172,39 +165,42 @@ function responderTexto(res, statusCode, texto) {
   res.end(texto)
 }
 
-// ─── WHATSAPP CLOUD API ──────────────────────────────────────────────────────
+// ─── EVOLUTION API — ENVIO ────────────────────────────────────────────────────
 
 async function enviarMensagemWhatsApp(numero, texto) {
-  if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
-    throw new Error('WHATSAPP_TOKEN ou WHATSAPP_PHONE_NUMBER_ID não configurado.')
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY || !EVOLUTION_INSTANCE) {
+    throw new Error('Variáveis EVOLUTION_API_URL, EVOLUTION_API_KEY ou EVOLUTION_INSTANCE não configuradas.')
   }
 
+  // A Evolution API espera o número no formato internacional sem + e sem @
+  // Ex: 5521999999999
+  const numeroLimpo = String(numero).replace(/\D/g, '')
+
   const body = JSON.stringify({
-    messaging_product: 'whatsapp',
-    to: numero,
-    type: 'text',
-    text: { body: texto }
+    number: numeroLimpo,
+    text: texto
   })
 
+  const urlCompleta = new URL(`/message/sendText/${EVOLUTION_INSTANCE}`, EVOLUTION_API_URL)
+
   const options = {
-    hostname: 'graph.facebook.com',
-    path: `/v23.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    hostname: urlCompleta.hostname,
+    port: urlCompleta.port || (urlCompleta.protocol === 'https:' ? 443 : 80),
+    path: urlCompleta.pathname,
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      'apikey': EVOLUTION_API_KEY,
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(body)
     }
   }
 
+  const lib = urlCompleta.protocol === 'https:' ? https : http
+
   return new Promise((resolve, reject) => {
-    const req = https.request(options, (apiRes) => {
+    const req = lib.request(options, (apiRes) => {
       let data = ''
-
-      apiRes.on('data', chunk => {
-        data += chunk
-      })
-
+      apiRes.on('data', chunk => { data += chunk })
       apiRes.on('end', () => {
         if (apiRes.statusCode >= 200 && apiRes.statusCode < 300) {
           resolve(data)
@@ -213,7 +209,6 @@ async function enviarMensagemWhatsApp(numero, texto) {
         }
       })
     })
-
     req.on('error', reject)
     req.write(body)
     req.end()
@@ -221,50 +216,74 @@ async function enviarMensagemWhatsApp(numero, texto) {
 }
 
 async function enviarPergunta(numero, etapa) {
-  await delay(3000)
+  await delay(2000)
   await enviarMensagemWhatsApp(numero, formatarPerguntaComOpcoes(etapa))
 }
 
-function extrairEventosWhatsApp(payload) {
+// ─── EVOLUTION API — RECEBIMENTO ──────────────────────────────────────────────
+
+/**
+ * A Evolution API envia webhooks com este formato:
+ * {
+ *   event: "messages.upsert",
+ *   instance: "nome-da-instancia",
+ *   data: {
+ *     key: { remoteJid: "5521999999999@s.whatsapp.net", fromMe: false, id: "MSG_ID" },
+ *     message: { conversation: "texto aqui" },
+ *     messageType: "conversation"
+ *   }
+ * }
+ */
+function extrairEventosEvolution(payload) {
   const eventos = []
 
-  const entries = payload?.entry || []
-  for (const entry of entries) {
-    const changes = entry?.changes || []
-    for (const change of changes) {
-      const value = change?.value || {}
-      const messages = value?.messages || []
+  // Ignora eventos que não são de mensagem recebida
+  const eventosAceitos = ['messages.upsert', 'MESSAGES_UPSERT']
+  if (!eventosAceitos.includes(payload?.event)) return eventos
 
-      for (const message of messages) {
-        const from = message?.from
-        if (!from) continue
+  const data = payload?.data
 
-        let texto = ''
+  // A Evolution API pode enviar um array ou um objeto único em data
+  const mensagens = Array.isArray(data) ? data : [data]
 
-        if (message.type === 'text') {
-          texto = message.text?.body || ''
-        } else if (message.type === 'button') {
-          texto = message.button?.text || ''
-        } else if (message.type === 'interactive') {
-          texto =
-            message.interactive?.button_reply?.title ||
-            message.interactive?.list_reply?.title ||
-            ''
-        }
+  for (const msg of mensagens) {
+    if (!msg) continue
 
-        if (!texto) continue
+    const key = msg.key || {}
 
-        eventos.push({
-          from,
-          texto: String(texto).trim(),
-          messageId: message.id || null
-        })
-      }
-    }
+    // Ignora mensagens enviadas pelo próprio bot
+    if (key.fromMe) continue
+
+    // Ignora grupos
+    const remoteJid = key.remoteJid || ''
+    if (remoteJid.endsWith('@g.us')) continue
+
+    const messageId = key.id || null
+
+    // Extrai o número limpo (remove @s.whatsapp.net)
+    const from = remoteJid.replace('@s.whatsapp.net', '').replace(/\D/g, '')
+    if (!from) continue
+
+    // Extrai o texto da mensagem (vários tipos possíveis)
+    const message = msg.message || {}
+    const texto = (
+      message.conversation ||
+      message.extendedTextMessage?.text ||
+      message.imageMessage?.caption ||
+      message.videoMessage?.caption ||
+      msg.body ||  // fallback para alguns formatos alternativos
+      ''
+    ).trim()
+
+    if (!texto) continue
+
+    eventos.push({ from, texto, messageId })
   }
 
   return eventos
 }
+
+// ─── LÓGICA DO FLUXO ─────────────────────────────────────────────────────────
 
 async function processarMensagemWhatsApp(numero, texto) {
   const tn = normalizarTexto(texto)
@@ -282,12 +301,7 @@ async function processarMensagemWhatsApp(numero, texto) {
 
   if (!sessao || !sessao.ativo) {
     if (tn.includes(MENSAGEM_GATILHO)) {
-      await criarOuAtualizarSessao(numero, {
-        etapa: 0,
-        respostas: {},
-        ativo: true
-      })
-
+      await criarOuAtualizarSessao(numero, { etapa: 0, respostas: {}, ativo: true })
       await enviarPergunta(numero, fluxo[0])
     }
     return
@@ -298,20 +312,11 @@ async function processarMensagemWhatsApp(numero, texto) {
 
   if (!validarResposta(etapaAtual, texto)) {
     if (etapaAtual.campo === 'idade') {
-      await enviarMensagemWhatsApp(
-        numero,
-        'Por favor, me informe sua idade usando apenas números. Ex.: *35*'
-      )
+      await enviarMensagemWhatsApp(numero, 'Por favor, me informe sua idade usando apenas números. Ex.: *35*')
     } else if (etapaAtual.opcoes) {
-      await enviarMensagemWhatsApp(
-        numero,
-        'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*'
-      )
+      await enviarMensagemWhatsApp(numero, 'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*')
     } else {
-      await enviarMensagemWhatsApp(
-        numero,
-        'Pode me responder novamente, por favor?'
-      )
+      await enviarMensagemWhatsApp(numero, 'Pode me responder novamente, por favor?')
     }
     return
   }
@@ -320,11 +325,7 @@ async function processarMensagemWhatsApp(numero, texto) {
     ? interpretarOpcao(etapaAtual, texto)
     : texto
 
-  const respostasAtualizadas = {
-    ...(sessao.respostas || {}),
-    [etapaAtual.campo]: respostaFinal
-  }
-
+  const respostasAtualizadas = { ...(sessao.respostas || {}), [etapaAtual.campo]: respostaFinal }
   const novaEtapa = sessao.etapa + 1
 
   await atualizarSessao(numero, {
@@ -335,25 +336,21 @@ async function processarMensagemWhatsApp(numero, texto) {
 
   if (novaEtapa < fluxo.length) {
     const prox = fluxo[novaEtapa]
-
     if (prox.campo === 'idade') {
-      await delay(3000)
+      await delay(2000)
       await enviarMensagemWhatsApp(numero, `Prazer, *${respostasAtualizadas.nome}*! 😊`)
     }
-
     await enviarPergunta(numero, prox)
   } else {
     await salvarLead(numero, numero, respostasAtualizadas)
     console.log('🆕 Novo lead:', respostasAtualizadas.nome, '|', numero)
-
-    await delay(3000)
+    await delay(2000)
     await enviarMensagemWhatsApp(numero, MENSAGEM_FINAL)
-
     await removerSessao(numero)
   }
 }
 
-// ─── FLUXO ───────────────────────────────────────────────────────────────────
+// ─── FLUXO DE PERGUNTAS ───────────────────────────────────────────────────────
 
 const fluxo = [
   {
@@ -422,39 +419,12 @@ const fluxo = [
 
 // ─── PÁGINAS HTML ─────────────────────────────────────────────────────────────
 
-function paginaWebhook() {
-  return `<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WhatsApp Cloud API</title>
-<style>
-  body{font-family:Arial,sans-serif;background:#f5f5f7;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-  .card{background:#fff;padding:32px;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,.08);max-width:520px;text-align:center}
-  h1{margin-top:0}
-  code{background:#f1f1f4;padding:4px 8px;border-radius:8px}
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>WhatsApp Cloud API ativa ✅</h1>
-    <p>Webhook pronto para verificação e recebimento de mensagens.</p>
-    <p>Use <code>/webhook</code> na configuração da Meta.</p>
-  </div>
-</body>
-</html>`
-}
-
 function gerarDashboard(leads, busca) {
   const termo = (busca || '').trim().toLowerCase()
-
   const leadsFiltrados = termo
     ? leads.filter(l =>
         [l.nome, l.phone, l.idade, l.dorPrincipal, l.objetivoAtual, formatarData(l.createdAt)]
-          .join(' ')
-          .toLowerCase()
-          .includes(termo)
+          .join(' ').toLowerCase().includes(termo)
       )
     : leads
 
@@ -463,7 +433,6 @@ function gerarDashboard(leads, busca) {
 
   const contagemDor = {}
   const contagemObj = {}
-
   leads.forEach(l => {
     if (l.dorPrincipal) contagemDor[l.dorPrincipal] = (contagemDor[l.dorPrincipal] || 0) + 1
     if (l.objetivoAtual) contagemObj[l.objetivoAtual] = (contagemObj[l.objetivoAtual] || 0) + 1
@@ -475,11 +444,9 @@ function gerarDashboard(leads, busca) {
   const linhas = leadsFiltrados.map(l => {
     const statusAtual = l.status || 'Novo'
     const classeStatus =
-      statusAtual === 'Agendado'
-        ? 'status-agendado'
-        : statusAtual === 'Contato feito'
-          ? 'status-contato'
-          : 'status-novo'
+      statusAtual === 'Agendado' ? 'status-agendado'
+      : statusAtual === 'Contato feito' ? 'status-contato'
+      : 'status-novo'
 
     return `
     <tr>
@@ -536,13 +503,13 @@ function gerarDashboard(leads, busca) {
     --font:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
   }
   body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
-  .topbar{background:rgba(255,255,255,.85);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;padding:0 32px;height:56px;display:flex;align-items:center;justify-content:space-between}
+  .topbar{background:rgba(255,255,255,.85);backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;padding:0 32px;height:56px;display:flex;align-items:center;justify-content:space-between}
   .topbar-brand{display:flex;align-items:center;gap:10px}
   .topbar-icon{width:28px;height:28px;background:var(--text);border-radius:7px;display:flex;align-items:center;justify-content:center}
   .topbar-title{font-size:15px;font-weight:600;letter-spacing:-.2px}
   .topbar-right{display:flex;align-items:center;gap:12px}
   .topbar-date{font-size:13px;color:var(--text2)}
-  .bot-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:5px 12px;border-radius:20px;text-decoration:none;background:#e9f8ee;color:#1a7a39}
+  .bot-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:5px 12px;border-radius:20px;background:#e9f8ee;color:#1a7a39}
   .bot-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
   .refresh-btn{display:flex;align-items:center;gap:6px;padding:6px 14px;background:var(--surface);border:1px solid var(--border2);border-radius:20px;font-size:13px;font-weight:500;color:var(--text);text-decoration:none;transition:background .15s}
   .refresh-btn:hover{background:var(--surface2)}
@@ -603,7 +570,7 @@ function gerarDashboard(leads, busca) {
   </div>
   <div class="topbar-right">
     <span class="topbar-date">${hoje}</span>
-    <span class="bot-status"><span class="dot"></span>Cloud API ativa</span>
+    <span class="bot-status"><span class="dot"></span>Evolution API ativa</span>
     <a href="/" class="refresh-btn">Atualizar</a>
   </div>
 </nav>
@@ -687,92 +654,92 @@ const server = http.createServer(async (req, res) => {
   const query = parseQuery(req.url)
 
   try {
-    if (urlPath === '/ping-meta') {
-      console.log('PING META ACESSADO')
+    if (urlPath === '/ping') {
       responderTexto(res, 200, 'ok')
       return
     }
 
-    if (req.method === 'GET' && urlPath === '/webhook') {
-      const mode = query['hub.mode']
-      const token = query['hub.verify_token']
-      const challenge = query['hub.challenge']
-
-      console.log('--- WEBHOOK VERIFY ---')
-      console.log('mode:', mode)
-      console.log('token recebido:', token)
-      console.log('challenge:', challenge)
-      console.log('token esperado:', VERIFY_TOKEN)
-      console.log('----------------------')
-
-      if (!mode && !token && !challenge) {
-        responderTexto(res, 200, 'Webhook online')
-        return
-      }
-
-      if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-        responderTexto(res, 200, challenge || '')
-      } else {
-        responderTexto(res, 403, 'Forbidden')
-      }
-      return
-    }
-
+    // ── WEBHOOK DA EVOLUTION API ──────────────────────────────────────────────
     if (req.method === 'POST' && urlPath === '/webhook') {
-      const rawBody = await parseBody(req)
-      let payload = {}
+      // Responde 200 imediatamente para a Evolution API não reenviar
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ ok: true }))
 
-      try {
-        payload = rawBody ? JSON.parse(rawBody) : {}
-      } catch {
-        responderJson(res, 400, { ok: false, error: 'JSON inválido' })
-        return
-      }
+      // Processa em background sem bloquear a resposta
+      setImmediate(async () => {
+        try {
+          const rawBody = await parseBody(req).catch(() => '{}')
+          let payload = {}
 
-      const eventos = extrairEventosWhatsApp(payload)
+          try { payload = rawBody ? JSON.parse(rawBody) : {} } catch { return }
 
-      for (const evento of eventos) {
-        await processarMensagemWhatsApp(evento.from, evento.texto)
-      }
+          // Verificação opcional de token de segurança
+          // A Evolution API pode enviar um header customizado configurado por você
+          if (EVOLUTION_WEBHOOK_TOKEN) {
+            const tokenRecebido = req.headers['apikey'] || req.headers['x-webhook-token'] || ''
+            if (tokenRecebido !== EVOLUTION_WEBHOOK_TOKEN) {
+              console.warn('⚠️ Webhook recebido com token inválido, ignorando.')
+              return
+            }
+          }
 
-      responderJson(res, 200, { ok: true })
+          const eventos = extrairEventosEvolution(payload)
+
+          for (const evento of eventos) {
+            // Deduplicação: ignora mensagem que já foi processada
+            if (evento.messageId) {
+              if (mensagensProcessadas.has(evento.messageId)) {
+                console.log('⏭️ Mensagem duplicada ignorada:', evento.messageId)
+                continue
+              }
+              mensagensProcessadas.add(evento.messageId)
+
+              // Limpa o cache se ficar grande demais
+              if (mensagensProcessadas.size > MAX_IDS_CACHE) {
+                const [primeiro] = mensagensProcessadas
+                mensagensProcessadas.delete(primeiro)
+              }
+            }
+
+            await processarMensagemWhatsApp(evento.from, evento.texto)
+          }
+        } catch (err) {
+          console.error('Erro ao processar webhook Evolution:', err)
+        }
+      })
+
       return
     }
 
+    // ── ROTA DE TESTE DE ENVIO ────────────────────────────────────────────────
     if (req.method === 'GET' && urlPath === '/teste-envio') {
       const numero = query.numero
-
       if (!numero) {
         responderTexto(res, 400, 'Informe ?numero=55DDDNUMERO')
         return
       }
-
-      const resultado = await enviarMensagemWhatsApp(
-        numero,
-        'Teste enviado pela WhatsApp Cloud API 🚀'
-      )
-
+      const resultado = await enviarMensagemWhatsApp(numero, 'Teste enviado pela Evolution API 🚀')
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
       res.end(resultado)
       return
     }
 
+    // ── ATUALIZAÇÃO DE STATUS DO LEAD ─────────────────────────────────────────
     if (req.method === 'POST' && urlPath === '/status') {
       const rawBody = await parseBody(req)
       const body = parseFormBody(rawBody)
       const { phone, status, busca = '' } = body
       const permitidos = ['Novo', 'Contato feito', 'Agendado']
-
       if (phone && status && permitidos.includes(status)) {
         await atualizarStatusLead(phone, status)
       }
-
       const qs = busca ? `?busca=${encodeURIComponent(busca)}` : ''
       res.writeHead(302, { Location: '/' + qs })
       res.end()
       return
     }
 
+    // ── APIs JSON ─────────────────────────────────────────────────────────────
     if (urlPath === '/api/status') {
       responderJson(res, 200, { status: botState.status })
       return
@@ -784,12 +751,7 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
-    if (urlPath === '/webhook-info') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(paginaWebhook())
-      return
-    }
-
+    // ── DASHBOARD ─────────────────────────────────────────────────────────────
     if (urlPath === '/' || urlPath === '/leads') {
       const leads = await listarLeads()
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -804,17 +766,13 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-// LOG GLOBAL DE TODAS AS REQUISIÇÕES
 server.on('request', (req) => {
-  console.log(`→ ${req.method} ${req.url} | UA: ${req.headers['user-agent']}`)
+  console.log(`→ ${req.method} ${req.url}`)
 })
-
-// ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
 
 server.listen(PORT, () => {
   console.log(`\n✅ Servidor rodando na porta ${PORT}`)
   console.log(`📊 Dashboard:       http://localhost:${PORT}`)
-  console.log(`🔗 Webhook info:    http://localhost:${PORT}/webhook-info`)
-  console.log(`🧪 Teste de envio:  http://localhost:${PORT}/teste-envio?numero=55DDDNUMERO`)
-  console.log(`📩 Webhook Meta:    http://localhost:${PORT}/webhook\n`)
+  console.log(`📩 Webhook:         http://localhost:${PORT}/webhook`)
+  console.log(`🧪 Teste de envio:  http://localhost:${PORT}/teste-envio?numero=55DDDNUMERO\n`)
 })
