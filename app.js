@@ -718,11 +718,17 @@ const server = http.createServer(async (req, res) => {
         responderTexto(res, 400, 'Informe ?numero=55DDDNUMERO')
         return
       }
-      const resultado = await enviarMensagemWhatsApp(numero, 'Teste enviado pela Evolution API 🚀')
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-      res.end(resultado)
+      try {
+        const resultado = await enviarMensagemWhatsApp(numero, 'Teste enviado pela Evolution API 🚀')
+        console.log('✅ Envio OK:', resultado)
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(resultado)
+      } catch (err) {
+        console.error('❌ Erro no envio:', err.message)
+        responderTexto(res, 500, 'Erro: ' + err.message)
+      }
       return
-    }
+}
 
     // ── ATUALIZAÇÃO DE STATUS DO LEAD ─────────────────────────────────────────
     if (req.method === 'POST' && urlPath === '/status') {
