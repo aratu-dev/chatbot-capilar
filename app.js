@@ -1,7 +1,5 @@
 const http = require('http')
 const https = require('https')
-const fetch = require('node-fetch')
-const fetch = require('node-fetch')
 const HttpsAgent = require('https').Agent
 
 const {
