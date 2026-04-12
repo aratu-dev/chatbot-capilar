@@ -21,6 +21,7 @@ const PORT = process.env.PORT || 3000
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL         // Ex: https://evolution.seudominio.com
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY         // Chave gerada na Evolution API
 const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE       // Nome da instância criada (ex: "terapia-capilar")
+const EVOLUTION_INSTANCE_TOKEN = process.env.EVOLUTION_INSTANCE_TOKEN
 
 // Token de segurança para verificar que o webhook veio da Evolution API
 const EVOLUTION_WEBHOOK_TOKEN = process.env.EVOLUTION_WEBHOOK_TOKEN || ''
