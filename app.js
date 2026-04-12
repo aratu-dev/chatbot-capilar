@@ -140,13 +140,15 @@ function responderTexto(res, statusCode, texto) {
 
 // ─── EVOLUTION API — ENVIO ────────────────────────────────────────────────────
 
+// Agente HTTPS que ignora certificado self-signed entre serviços Railway
+const httpsAgent = new https.Agent({ rejectUnauthorized: false })
+
 async function enviarMensagemWhatsApp(numero, texto) {
   if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY || !EVOLUTION_INSTANCE) {
     throw new Error('Variáveis EVOLUTION_API_URL, EVOLUTION_API_KEY ou EVOLUTION_INSTANCE não configuradas.')
   }
 
   const numeroLimpo = String(numero).replace(/\D/g, '')
-  // A Evolution API v2 usa o token da instância no header apikey
   const apiKey = EVOLUTION_INSTANCE_TOKEN || EVOLUTION_API_KEY
 
   const body = JSON.stringify({
@@ -155,17 +157,18 @@ async function enviarMensagemWhatsApp(numero, texto) {
   })
 
   const urlCompleta = new URL(`/message/sendText/${EVOLUTION_INSTANCE}`, EVOLUTION_API_URL)
+  const isHttps = urlCompleta.protocol === 'https:'
 
-  console.log(`📤 Enviando mensagem para ${numeroLimpo}`)
-  console.log(`🌐 URL: ${urlCompleta.href}`)
-  console.log(`🔑 apikey (primeiros 8 chars): ${apiKey.substring(0, 8)}...`)
+  console.log(`📤 Enviando para ${numeroLimpo} | URL: ${urlCompleta.href}`)
+  console.log(`🔑 apikey: ${apiKey.substring(0, 8)}...`)
 
   const options = {
     hostname: urlCompleta.hostname,
-    port: urlCompleta.port || (urlCompleta.protocol === 'https:' ? 443 : 80),
+    port: urlCompleta.port || (isHttps ? 443 : 80),
     path: urlCompleta.pathname,
     method: 'POST',
     timeout: 15000,
+    agent: isHttps ? httpsAgent : undefined,
     headers: {
       'apikey': apiKey,
       'Content-Type': 'application/json',
@@ -173,7 +176,7 @@ async function enviarMensagemWhatsApp(numero, texto) {
     }
   }
 
-  const lib = urlCompleta.protocol === 'https:' ? https : http
+  const lib = isHttps ? https : http
 
   return new Promise((resolve, reject) => {
     const req = lib.request(options, (apiRes) => {
