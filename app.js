@@ -189,7 +189,7 @@ async function enviarMensagemWhatsApp(numero, texto) {
     path: urlCompleta.pathname,
     method: 'POST',
     headers: {
-      'apikey': EVOLUTION_API_KEY,
+      'apikey': process.env.EVOLUTION_INSTANCE_TOKEN || EVOLUTION_API_KEY,
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(body)
     }
