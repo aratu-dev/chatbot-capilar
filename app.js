@@ -1,5 +1,8 @@
 const http = require('http')
 const https = require('https')
+const fetch = require('node-fetch')
+const fetch = require('node-fetch')
+const HttpsAgent = require('https').Agent
 
 const {
   buscarSessao,
@@ -140,7 +143,7 @@ function responderTexto(res, statusCode, texto) {
 
 // ─── EVOLUTION API — ENVIO ────────────────────────────────────────────────────
 
-// Agente HTTPS que ignora certificado self-signed entre serviços Railway
+// Agente que ignora SSL self-signed entre serviços Railway
 const httpsAgent = new https.Agent({ rejectUnauthorized: false })
 
 async function enviarMensagemWhatsApp(numero, texto) {
@@ -150,61 +153,45 @@ async function enviarMensagemWhatsApp(numero, texto) {
 
   const numeroLimpo = String(numero).replace(/\D/g, '')
   const apiKey = EVOLUTION_INSTANCE_TOKEN || EVOLUTION_API_KEY
+  const url = `${EVOLUTION_API_URL}/message/sendText/${EVOLUTION_INSTANCE}`
 
-  const body = JSON.stringify({
-    number: numeroLimpo,
-    text: texto
-  })
-
-  const urlCompleta = new URL(`/message/sendText/${EVOLUTION_INSTANCE}`, EVOLUTION_API_URL)
-  const isHttps = urlCompleta.protocol === 'https:'
-
-  console.log(`📤 Enviando para ${numeroLimpo} | URL: ${urlCompleta.href}`)
+  console.log(`📤 Enviando para ${numeroLimpo} | URL: ${url}`)
   console.log(`🔑 apikey: ${apiKey.substring(0, 8)}...`)
 
-  const options = {
-    hostname: urlCompleta.hostname,
-    port: urlCompleta.port || (isHttps ? 443 : 80),
-    path: urlCompleta.pathname,
-    method: 'POST',
-    timeout: 15000,
-    agent: isHttps ? httpsAgent : undefined,
-    headers: {
-      'apikey': apiKey,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 15000)
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'apikey': apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ number: numeroLimpo, text: texto }),
+      agent: url.startsWith('https') ? httpsAgent : undefined,
+      signal: controller.signal
+    })
+
+    const data = await response.text()
+    console.log(`📬 Resposta Evolution API: status=${response.status}`)
+    console.log(`📬 Body: ${data.substring(0, 300)}`)
+
+    if (!response.ok) {
+      throw new Error(`Erro ${response.status}: ${data}`)
     }
+
+    return data
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Timeout: Evolution API não respondeu em 15 segundos')
+    }
+    console.error('❌ Erro na chamada à Evolution API:', err.message)
+    throw err
+  } finally {
+    clearTimeout(timeout)
   }
-
-  const lib = isHttps ? https : http
-
-  return new Promise((resolve, reject) => {
-    const req = lib.request(options, (apiRes) => {
-      let data = ''
-      apiRes.on('data', chunk => { data += chunk })
-      apiRes.on('end', () => {
-        console.log(`📬 Resposta Evolution API: status=${apiRes.statusCode}`)
-        console.log(`📬 Body: ${data.substring(0, 300)}`)
-        if (apiRes.statusCode >= 200 && apiRes.statusCode < 300) {
-          resolve(data)
-        } else {
-          reject(new Error(`Erro ${apiRes.statusCode}: ${data}`))
-        }
-      })
-    })
-    req.on('timeout', () => {
-      req.destroy()
-      reject(new Error('Timeout: Evolution API não respondeu em 15 segundos'))
-    })
-    req.on('error', (err) => {
-      console.error('❌ Erro HTTP na chamada à Evolution API:', err.message)
-      reject(err)
-    })
-    req.write(body)
-    req.end()
-  })
 }
-
 async function enviarPergunta(numero, etapa) {
   await delay(2000)
   await enviarMensagemWhatsApp(numero, formatarPerguntaComOpcoes(etapa))
