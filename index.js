@@ -2,38 +2,50 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys')
 const qrcode = require('qrcode-terminal')
 const P = require('pino')
-const fs = require('fs')
-const path = require('path')
+const { PrismaClient } = require('@prisma/client')
+
+const prisma = new PrismaClient()
 
 // ─── CONFIGURAÇÕES ───────────────────────────────────────────────────────────
 
-// ✅ CORRIGIDO: sem acento e sem ponto final para comparação flexível
 const MENSAGEM_GATILHO = 'quero conhecer a clinica'
 const COMANDOS_REINICIO = ['menu', 'reiniciar', 'comecar', 'começar']
 
-const MENSAGEM_FINAL = `✅ *Perfeito!* Já tenho informações suficientes para o seu pré-atendimento.
+const MENSAGEM_FINAL_AGENDAR = `✅ *Perfeito!* Já tenho tudo que preciso para o seu pré-atendimento.
 
-Nossa terapeuta capilar vai conseguir te atender com mais direcionamento 💚
+Nossa terapeuta capilar vai conseguir te atender com muito mais direcionamento 💚
 
-📅 Para dar o próximo passo, clique no link abaixo e agende sua consulta:
+📅 Clique no link abaixo e escolha o melhor horário para você:
 
 👉 https://calendly.com/SEU_LINK_AQUI
 
-_Se precisar, é só me chamar._ 😊`
+_Qualquer dúvida, é só chamar aqui._ 😊`
 
-const CAMINHO_CSV = path.join(__dirname, 'leads.csv')
-const CAMINHO_ESTADO = path.join(__dirname, 'estado.json')
+const MENSAGEM_FINAL_ATENDENTE = `Combinado! 😊 Vou chamar uma de nossas atendentes para tirar todas as suas dúvidas.
+
+⏳ Em breve alguém entrará em contato com você por aqui.
+
+_Enquanto isso, fique à vontade para dar uma olhada no nosso Instagram_ 💚`
 
 // ─── FUNÇÕES AUXILIARES ──────────────────────────────────────────────────────
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Simula tempo de digitação proporcional ao tamanho da mensagem
+function tempoDigitacao(texto = '') {
+  const base = 1500
+  const porCaractere = 30
+  const maximo = 4000
+  return Math.min(base + texto.length * porCaractere, maximo)
+}
+
 function normalizarTexto(texto = '') {
-  return texto
+  return String(texto)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
@@ -45,67 +57,48 @@ function extrairTextoMensagem(msg) {
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
     msg.message?.imageMessage?.caption ||
+    msg.message?.videoMessage?.caption ||
     ''
   ).trim()
 }
 
 function formatarPerguntaComOpcoes(etapa) {
-  if (!etapa.opcoes || etapa.opcoes.length === 0) {
-    return etapa.pergunta
-  }
-
-  const lista = etapa.opcoes
-    .map((opcao, index) => `${index + 1} - ${opcao.label}`)
-    .join('\n')
-
+  if (!etapa.opcoes || etapa.opcoes.length === 0) return etapa.pergunta
+  const lista = etapa.opcoes.map((o, i) => `${i + 1} - ${o.label}`).join('\n')
   return `${etapa.pergunta}\n\n${lista}`
 }
 
+async function enviarMensagem(sock, jid, texto) {
+  await delay(tempoDigitacao(texto))
+  await sock.sendMessage(jid, { text: texto })
+}
+
 async function enviarPergunta(sock, jid, etapa) {
-  await delay(3000)
-  await sock.sendMessage(jid, { text: formatarPerguntaComOpcoes(etapa) })
+  await enviarMensagem(sock, jid, formatarPerguntaComOpcoes(etapa))
 }
 
-function validarNome(texto) {
-  return texto.trim().length >= 2
-}
-
+function validarNome(texto) { return String(texto).trim().length >= 2 }
 function validarIdade(texto) {
-  const idade = parseInt(texto, 10)
-  return !isNaN(idade) && idade >= 1 && idade <= 120
+  const n = parseInt(texto, 10)
+  return !isNaN(n) && n >= 1 && n <= 120
 }
 
 function interpretarOpcao(etapa, respostaTexto) {
   if (!etapa.opcoes || etapa.opcoes.length === 0) return null
-
-  const respostaNormalizada = normalizarTexto(respostaTexto)
-
-  // 1) Número da opção
-  const numero = parseInt(respostaNormalizada, 10)
-  if (!isNaN(numero) && numero >= 1 && numero <= etapa.opcoes.length) {
-    return etapa.opcoes[numero - 1].label
+  const r = normalizarTexto(respostaTexto)
+  const num = parseInt(r, 10)
+  if (!isNaN(num) && num >= 1 && num <= etapa.opcoes.length) return etapa.opcoes[num - 1].label
+  for (const o of etapa.opcoes) {
+    if (r === normalizarTexto(o.label)) return o.label
+    if (o.aliases?.some(a => normalizarTexto(a) === r)) return o.label
   }
-
-  // 2) Label exato ou alias exato
-  for (const opcao of etapa.opcoes) {
-    const labelNormalizado = normalizarTexto(opcao.label)
-    if (respostaNormalizada === labelNormalizado) return opcao.label
-    if (opcao.aliases?.some(alias => normalizarTexto(alias) === respostaNormalizada)) {
-      return opcao.label
+  for (const o of etapa.opcoes) {
+    const candidatos = [o.label, ...(o.aliases || [])]
+    for (const c of candidatos) {
+      const cn = normalizarTexto(c)
+      if (r.includes(cn) || cn.includes(r)) return o.label
     }
   }
-
-  // 3) Correspondência parcial
-  for (const opcao of etapa.opcoes) {
-    const candidatos = [opcao.label, ...(opcao.aliases || [])]
-    for (const candidato of candidatos) {
-      const candNorm = normalizarTexto(candidato)
-      if (respostaNormalizada.includes(candNorm) || candNorm.includes(respostaNormalizada)) {
-        return opcao.label
-      }
-    }
-  }
-
   return null
 }
 
@@ -113,70 +106,7 @@ function validarResposta(etapa, texto) {
   if (etapa.campo === 'nome') return validarNome(texto)
   if (etapa.campo === 'idade') return validarIdade(texto)
   if (etapa.opcoes) return interpretarOpcao(etapa, texto) !== null
-  return texto.trim().length > 0
-}
-
-function escaparCSV(valor = '') {
-  const texto = String(valor).replace(/"/g, '""')
-  return `"${texto}"`
-}
-
-function formatarDataHora() {
-  return new Date().toLocaleString('pt-BR')
-}
-
-function extrairTelefone(jid = '') {
-  return jid.replace('@s.whatsapp.net', '')
-}
-
-function garantirArquivoCSV() {
-  if (!fs.existsSync(CAMINHO_CSV)) {
-    const cabecalho = [
-      'dataHora', 'telefone', 'nome', 'idade',
-      'dorPrincipal', 'intensidade', 'tempoProblema',
-      'tratamentoAnterior', 'objetivoAtual', 'quimica'
-    ].join(';')
-    fs.writeFileSync(CAMINHO_CSV, cabecalho + '\n', 'utf8')
-    console.log('📄 Arquivo leads.csv criado.')
-  }
-}
-
-function salvarLeadCSV(jid, respostas) {
-  garantirArquivoCSV()
-  const linha = [
-    escaparCSV(formatarDataHora()),
-    escaparCSV(extrairTelefone(jid)),
-    escaparCSV(respostas.nome || ''),
-    escaparCSV(respostas.idade || ''),
-    escaparCSV(respostas.dorPrincipal || ''),
-    escaparCSV(respostas.intensidade || ''),
-    escaparCSV(respostas.tempoProblema || ''),
-    escaparCSV(respostas.tratamentoAnterior || ''),
-    escaparCSV(respostas.objetivoAtual || ''),
-    escaparCSV(respostas.quimica || '')
-  ].join(';')
-  fs.appendFileSync(CAMINHO_CSV, linha + '\n', 'utf8')
-  console.log('💾 Lead salvo no CSV.')
-}
-
-// ✅ NOVO: persiste o estado dos usuários em disco
-function carregarEstado() {
-  try {
-    if (fs.existsSync(CAMINHO_ESTADO)) {
-      return JSON.parse(fs.readFileSync(CAMINHO_ESTADO, 'utf8'))
-    }
-  } catch (e) {
-    console.warn('⚠️ Não foi possível carregar estado.json, iniciando vazio.')
-  }
-  return {}
-}
-
-function salvarEstado(usuarios) {
-  try {
-    fs.writeFileSync(CAMINHO_ESTADO, JSON.stringify(usuarios, null, 2), 'utf8')
-  } catch (e) {
-    console.error('Erro ao salvar estado:', e)
-  }
+  return String(texto).trim().length > 0
 }
 
 // ─── FLUXO DE PRÉ-ATENDIMENTO ────────────────────────────────────────────────
@@ -184,27 +114,28 @@ function salvarEstado(usuarios) {
 const fluxo = [
   {
     campo: 'nome',
-    pergunta: '👋 Olá! Seja bem-vindo(a) à *Terapia Capilar* ✨\n\nAntes de começarmos, qual é o seu nome?'
+    pergunta: '👋 Olá! Seja bem-vindo(a) à *Clínica de Terapia Capilar* ✨\n\nAntes de começarmos, qual é o seu nome?'
   },
   {
     campo: 'idade',
+    // pergunta gerada dinamicamente com o nome — veja processarMensagem()
     pergunta: 'Pra gente te atender da melhor forma, me conta: qual a sua idade?'
   },
   {
     campo: 'dorPrincipal',
-    pergunta: 'Entendi. Agora me conta uma coisa 👇\n\nQual problema mais tem te incomodado no seu cabelo ultimamente?',
+    pergunta: 'Entendido! Agora me conta uma coisa 👇\n\nQual problema tem te incomodado mais no seu cabelo ultimamente?',
     opcoes: [
       { label: 'Queda de cabelo', aliases: ['queda', 'cai muito', 'cabelo caindo', 'queda capilar'] },
-      { label: 'Falta de crescimento', aliases: ['nao cresce', 'nao cresce', 'crescimento', 'demora a crescer'] },
+      { label: 'Falta de crescimento', aliases: ['nao cresce', 'crescimento', 'demora a crescer'] },
       { label: 'Ressecamento / frizz', aliases: ['ressecamento', 'frizz', 'ressecado', 'seco'] }
     ]
   },
   {
     campo: 'intensidade',
-    pergunta: 'E isso tem te incomodado em qual nível?',
+    pergunta: 'E em qual nível isso tem te incomodado?',
     opcoes: [
       { label: 'Pouco, mas quero cuidar', aliases: ['pouco', 'leve', 'quero cuidar'] },
-      { label: 'Médio, já está me preocupando', aliases: ['medio', 'medio', 'preocupando', 'me preocupa'] },
+      { label: 'Médio, já está me preocupando', aliases: ['medio', 'preocupando', 'me preocupa'] },
       { label: 'Muito, está afetando minha autoestima', aliases: ['muito', 'autoestima', 'demais', 'bastante'] }
     ]
   },
@@ -221,9 +152,9 @@ const fluxo = [
     campo: 'tratamentoAnterior',
     pergunta: 'Você já tentou algum tratamento antes?',
     opcoes: [
-      { label: 'Sim, com profissional', aliases: ['com profissional', 'clinica', 'clinica'] },
+      { label: 'Sim, com profissional', aliases: ['com profissional', 'clinica', 'profissional'] },
       { label: 'Sim, por conta própria', aliases: ['por conta propria', 'sozinho', 'sozinha', 'em casa'] },
-      { label: 'Ainda não, estou buscando ajuda agora', aliases: ['ainda nao', 'primeira vez', 'buscando ajuda'] }
+      { label: 'Ainda não, estou buscando ajuda agora', aliases: ['ainda nao', 'primeira vez', 'buscando ajuda', 'nao'] }
     ]
   },
   {
@@ -232,37 +163,217 @@ const fluxo = [
     opcoes: [
       { label: 'Resolver o problema de vez', aliases: ['resolver', 'de vez', 'solucionar'] },
       { label: 'Melhorar a aparência do cabelo', aliases: ['melhorar aparencia', 'aparencia'] },
-      { label: 'Entender o que está acontecendo', aliases: ['entender', 'descobrir', 'saber o que esta acontecendo'] }
+      { label: 'Entender o que está acontecendo', aliases: ['entender', 'descobrir', 'saber'] }
     ]
   },
   {
     campo: 'quimica',
-    pergunta: 'Você faz uso de química nos fios com frequência?',
+    pergunta: 'Você usa química nos fios com frequência?',
     opcoes: [
-      { label: 'Sim, com frequência', aliases: ['sim', 'frequencia', 'uso quimica'] },
+      { label: 'Sim, com frequência', aliases: ['sim', 'frequencia', 'uso quimica', 'uso'] },
       { label: 'Raramente', aliases: ['raramente', 'as vezes', 'de vez em quando'] },
-      { label: 'Não uso', aliases: ['nao uso', 'nunca', 'sem quimica'] }
+      { label: 'Não uso', aliases: ['nao uso', 'nunca', 'sem quimica', 'nao'] }
+    ]
+  },
+  // ── BIFURCAÇÃO FINAL ──────────────────────────────────────────────────────
+  {
+    campo: 'proximoPasso',
+    pergunta: (nome) => `Muito obrigada, *${nome}*! 🙏 Com essas informações nossa terapeuta já consegue te atender com muito mais direcionamento.\n\nComo você prefere prosseguir?`,
+    opcoes: [
+      { label: 'Quero agendar minha consulta agora', aliases: ['agendar', 'agendar agora', 'consulta', 'marcar'] },
+      { label: 'Prefiro tirar dúvidas com uma atendente', aliases: ['duvidas', 'atendente', 'falar', 'conversar', 'tirar duvidas'] }
     ]
   }
 ]
 
-// ─── ESTADO DOS USUÁRIOS ─────────────────────────────────────────────────────
+// ─── PERSISTÊNCIA NO POSTGRES ─────────────────────────────────────────────────
 
-let usuarios = carregarEstado()
+async function buscarSessao(telefone) {
+  try {
+    return await prisma.session.findUnique({ where: { phone: telefone } })
+  } catch {
+    return null
+  }
+}
 
-// ─── FUNÇÃO PRINCIPAL ────────────────────────────────────────────────────────
+async function salvarSessao(telefone, dados) {
+  try {
+    await prisma.session.upsert({
+      where: { phone: telefone },
+      update: { data: dados, updatedAt: new Date() },
+      create: { phone: telefone, data: dados }
+    })
+  } catch (e) {
+    console.error('Erro ao salvar sessão:', e.message)
+  }
+}
+
+async function removerSessao(telefone) {
+  try {
+    await prisma.session.deleteMany({ where: { phone: telefone } })
+  } catch { }
+}
+
+async function salvarLeadBanco(telefone, respostas) {
+  try {
+    await prisma.lead.upsert({
+      where: { phone: telefone },
+      update: {
+        nome: respostas.nome,
+        idade: respostas.idade,
+        dorPrincipal: respostas.dorPrincipal,
+        intensidade: respostas.intensidade,
+        tempoProblema: respostas.tempoProblema,
+        tratamentoAnterior: respostas.tratamentoAnterior,
+        objetivoAtual: respostas.objetivoAtual,
+        quimica: respostas.quimica,
+        proximoPasso: respostas.proximoPasso,
+        updatedAt: new Date()
+      },
+      create: {
+        phone: telefone,
+        nome: respostas.nome,
+        idade: respostas.idade,
+        dorPrincipal: respostas.dorPrincipal,
+        intensidade: respostas.intensidade,
+        tempoProblema: respostas.tempoProblema,
+        tratamentoAnterior: respostas.tratamentoAnterior,
+        objetivoAtual: respostas.objetivoAtual,
+        quimica: respostas.quimica,
+        proximoPasso: respostas.proximoPasso,
+        status: 'Novo'
+      }
+    })
+    console.log('💾 Lead salvo no banco:', respostas.nome, '|', telefone)
+  } catch (e) {
+    console.error('Erro ao salvar lead:', e.message)
+  }
+}
+
+// ─── PROCESSAMENTO DE MENSAGENS ───────────────────────────────────────────────
+
+// Proteção contra flood: guarda último timestamp por número
+const ultimaMensagem = new Map()
+
+async function processarMensagem(sock, jid, texto) {
+  const telefone = jid.replace('@s.whatsapp.net', '')
+  const agora = Date.now()
+
+  // Ignora mensagens duplicadas em menos de 2 segundos
+  const ultima = ultimaMensagem.get(telefone) || 0
+  if (agora - ultima < 2000) return
+  ultimaMensagem.set(telefone, agora)
+
+  const textoNorm = normalizarTexto(texto)
+
+  // Comando de reinício
+  if (COMANDOS_REINICIO.includes(textoNorm)) {
+    await removerSessao(telefone)
+    await enviarMensagem(sock, jid, '🔄 Atendimento reiniciado!\n\nPara começar, envie:\n*Olá, quero conhecer a clínica.*')
+    return
+  }
+
+  const sessao = await buscarSessao(telefone)
+  const dados = sessao?.data || null
+
+  // Sem sessão ativa — aguarda gatilho
+  if (!dados || !dados.ativo) {
+    if (textoNorm.includes(MENSAGEM_GATILHO)) {
+      await salvarSessao(telefone, { etapa: 0, respostas: {}, ativo: true })
+      await enviarPergunta(sock, jid, fluxo[0])
+    }
+    return
+  }
+
+  const etapaAtual = fluxo[dados.etapa]
+  if (!etapaAtual) return
+
+  // Valida resposta
+  if (!validarResposta(etapaAtual, texto)) {
+    if (etapaAtual.campo === 'idade') {
+      await enviarMensagem(sock, jid, 'Por favor, me informe sua idade usando apenas números. Ex.: *28*')
+    } else if (etapaAtual.opcoes) {
+      await enviarMensagem(sock, jid, 'Pode responder com o número da opção ou com o texto mesmo 😊\n\nEx.: *1* ou *Queda de cabelo*')
+    } else {
+      await enviarMensagem(sock, jid, 'Pode me responder novamente, por favor?')
+    }
+    return
+  }
+
+  // Interpreta resposta
+  const respostaFinal = etapaAtual.opcoes
+    ? interpretarOpcao(etapaAtual, texto)
+    : texto.trim()
+
+  const respostasAtualizadas = { ...(dados.respostas || {}), [etapaAtual.campo]: respostaFinal }
+  const novaEtapa = dados.etapa + 1
+
+  // Mensagem especial ao registrar o nome
+  if (etapaAtual.campo === 'nome') {
+    const primeiroNome = respostaFinal.split(' ')[0]
+    await delay(1000)
+    await enviarMensagem(sock, jid, `Prazer, *${primeiroNome}*! 😊`)
+  }
+
+  // Fim do fluxo
+  if (novaEtapa >= fluxo.length) {
+    await salvarSessao(telefone, { etapa: novaEtapa, respostas: respostasAtualizadas, ativo: false })
+    await salvarLeadBanco(telefone, respostasAtualizadas)
+
+    console.log('\n===== NOVO LEAD =====')
+    console.log('WhatsApp:', telefone)
+    console.log('Respostas:', respostasAtualizadas)
+    console.log('Próximo passo:', respostaFinal)
+    console.log('=====================\n')
+
+    // Bifurcação baseada na escolha final
+    if (respostaFinal === 'Quero agendar minha consulta agora') {
+      await enviarMensagem(sock, jid, MENSAGEM_FINAL_AGENDAR)
+    } else {
+      await enviarMensagem(sock, jid, MENSAGEM_FINAL_ATENDENTE)
+    }
+
+    await removerSessao(telefone)
+    return
+  }
+
+  // Avança para próxima etapa
+  await salvarSessao(telefone, { etapa: novaEtapa, respostas: respostasAtualizadas, ativo: true })
+
+  const proximaEtapa = fluxo[novaEtapa]
+
+  // Pergunta da bifurcação final usa o nome
+  if (proximaEtapa.campo === 'proximoPasso') {
+    const nome = respostasAtualizadas.nome?.split(' ')[0] || ''
+    const pergunta = typeof proximaEtapa.pergunta === 'function'
+      ? proximaEtapa.pergunta(nome)
+      : proximaEtapa.pergunta
+    const lista = proximaEtapa.opcoes.map((o, i) => `${i + 1} - ${o.label}`).join('\n')
+    await enviarMensagem(sock, jid, `${pergunta}\n\n${lista}`)
+    return
+  }
+
+  await enviarPergunta(sock, jid, proximaEtapa)
+}
+
+// ─── BOT PRINCIPAL ────────────────────────────────────────────────────────────
+
+let tentativasReconexao = 0
 
 async function iniciarBot() {
-  garantirArquivoCSV()
-
   const { state, saveCreds } = await useMultiFileAuthState('auth_info')
   const { version } = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, P({ level: 'silent' }))
+    },
     printQRInTerminal: false,
-    logger: P({ level: 'silent' })
+    logger: P({ level: 'silent' }),
+    generateHighQualityLinkPreview: false,
+    syncFullHistory: false
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -271,20 +382,29 @@ async function iniciarBot() {
     if (qr) {
       console.log('\n📱 Escaneie o QR Code abaixo com seu WhatsApp:\n')
       qrcode.generate(qr, { small: true })
+      console.log('\n')
     }
 
     if (connection === 'close') {
       const codigo = lastDisconnect?.error?.output?.statusCode
       const deveReconectar = codigo !== DisconnectReason.loggedOut
-      console.log('⚠️ Conexão encerrada. Código:', codigo, '| Reconectando:', deveReconectar)
+
+      console.log('⚠️ Conexão encerrada. Código:', codigo)
+
       if (deveReconectar) {
-        setTimeout(() => iniciarBot(), 3000)
+        // Backoff exponencial: 3s, 6s, 12s, máx 30s
+        tentativasReconexao++
+        const espera = Math.min(3000 * Math.pow(2, tentativasReconexao - 1), 30000)
+        console.log(`🔄 Reconectando em ${espera / 1000}s... (tentativa ${tentativasReconexao})`)
+        setTimeout(() => iniciarBot(), espera)
       } else {
-        console.log('🔴 Sessão encerrada. Delete a pasta auth_info e rode novamente.')
+        console.log('🔴 Sessão encerrada pelo WhatsApp. Delete a pasta auth_info e reinicie.')
+        process.exit(1)
       }
     }
 
     if (connection === 'open') {
+      tentativasReconexao = 0
       console.log('✅ Bot conectado ao WhatsApp com sucesso!')
     }
   })
@@ -301,83 +421,10 @@ async function iniciarBot() {
     const texto = extrairTextoMensagem(msg)
     if (!texto) return
 
-    const textoNormalizado = normalizarTexto(texto)
-
     try {
-      // Reinício manual
-      if (COMANDOS_REINICIO.includes(textoNormalizado)) {
-        delete usuarios[jid]
-        salvarEstado(usuarios)
-        await sock.sendMessage(jid, {
-          text: '🔄 Atendimento reiniciado.\n\nPara começar, envie:\n*Olá, quero conhecer a clínica.*'
-        })
-        return
-      }
-
-      // ✅ CORRIGIDO: comparação flexível com .includes()
-      if (!usuarios[jid]) {
-        if (textoNormalizado.includes(MENSAGEM_GATILHO)) {
-          usuarios[jid] = { etapa: 0, respostas: {} }
-          salvarEstado(usuarios)
-          await enviarPergunta(sock, jid, fluxo[0])
-        }
-        return
-      }
-
-      const estadoUsuario = usuarios[jid]
-      const etapaAtual = fluxo[estadoUsuario.etapa]
-      if (!etapaAtual) return
-
-      const respostaValida = validarResposta(etapaAtual, texto)
-
-      if (!respostaValida) {
-        if (etapaAtual.campo === 'idade') {
-          await sock.sendMessage(jid, { text: 'Por favor, me informe sua idade usando apenas números. Ex.: *35*' })
-        } else if (etapaAtual.opcoes) {
-          await sock.sendMessage(jid, { text: 'Pode me responder com o número da opção ou com o texto.\n\nExemplo: *1* ou *Queda de cabelo*' })
-        } else {
-          await sock.sendMessage(jid, { text: 'Pode me responder novamente, por favor?' })
-        }
-        return
-      }
-
-      let respostaFinal = texto
-      if (etapaAtual.opcoes) {
-        respostaFinal = interpretarOpcao(etapaAtual, texto)
-      }
-
-      estadoUsuario.respostas[etapaAtual.campo] = respostaFinal
-      estadoUsuario.etapa += 1
-      salvarEstado(usuarios)
-
-      if (estadoUsuario.etapa < fluxo.length) {
-        const proximaPergunta = fluxo[estadoUsuario.etapa]
-
-        if (proximaPergunta.campo === 'idade') {
-          const nome = estadoUsuario.respostas.nome
-          await delay(3000)
-          await sock.sendMessage(jid, { text: `Prazer, *${nome}*! 😊` })
-          await enviarPergunta(sock, jid, proximaPergunta)
-          return
-        }
-
-        await enviarPergunta(sock, jid, proximaPergunta)
-      } else {
-        console.log('\n===== NOVO LEAD =====')
-        console.log('WhatsApp:', jid)
-        console.log('Respostas:', estadoUsuario.respostas)
-        console.log('=====================\n')
-
-        salvarLeadCSV(jid, estadoUsuario.respostas)
-
-        await delay(3000)
-        await sock.sendMessage(jid, { text: MENSAGEM_FINAL })
-
-        delete usuarios[jid]
-        salvarEstado(usuarios)
-      }
+      await processarMensagem(sock, jid, texto)
     } catch (err) {
-      console.error('Erro ao processar mensagem:', err)
+      console.error('Erro ao processar mensagem:', err.message)
     }
   })
 }
